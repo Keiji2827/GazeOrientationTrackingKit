@@ -14,7 +14,7 @@ try:
 except ImportError:
     import pickle
 
-from metro.utils.geometric_layers import rodrigues
+from models.utils.geometric_layers import rodrigues
 import models.data.config as cfg
 
 class SMPL(nn.Module):
@@ -34,10 +34,10 @@ class SMPL(nn.Module):
         row = J_regressor.row
         col = J_regressor.col
         data = J_regressor.data
-        i = torch.LongTensor([row, col])
-        v = torch.FloatTensor(data)
+        i = torch.from_numpy(np.array([row, col])).long()
+        v = torch.from_numpy(np.array(data)).float()
         J_regressor_shape = [24, 6890]
-        self.register_buffer('J_regressor', torch.sparse.FloatTensor(i, v, J_regressor_shape).to_dense())
+        self.register_buffer('J_regressor', torch.sparse_coo_tensor(i, v, J_regressor_shape).to_dense())
         self.register_buffer('weights', torch.FloatTensor(smpl_model['weights']))
         self.register_buffer('posedirs', torch.FloatTensor(smpl_model['posedirs']))
         self.register_buffer('v_template', torch.FloatTensor(smpl_model['v_template']))
@@ -168,13 +168,13 @@ def scipy_to_pytorch(A, U, D):
         u = scipy.sparse.coo_matrix(U[i])
         i = torch.LongTensor(np.array([u.row, u.col]))
         v = torch.FloatTensor(u.data)
-        ptU.append(torch.sparse.FloatTensor(i, v, u.shape))
+        ptU.append(torch.sparse_coo_tensor(i, v, u.shape))
     
     for i in range(len(D)):
         d = scipy.sparse.coo_matrix(D[i])
         i = torch.LongTensor(np.array([d.row, d.col]))
         v = torch.FloatTensor(d.data)
-        ptD.append(torch.sparse.FloatTensor(i, v, d.shape)) 
+        ptD.append(torch.sparse_coo_tensor(i, v, d.shape)) 
 
     return ptU, ptD
 
@@ -197,7 +197,7 @@ def adjmat_sparse(adjmat, nsize=1):
     data = adjmat.data
     i = torch.LongTensor(np.array([row, col]))
     v = torch.from_numpy(data).float()
-    adjmat = torch.sparse.FloatTensor(i, v, adjmat.shape)
+    adjmat = torch.sparse_coo_tensor(i, v, adjmat.shape)
     return adjmat
 
 def get_graph_params(filename, nsize=1):

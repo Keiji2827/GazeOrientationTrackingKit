@@ -4,7 +4,7 @@ import copy
 #import numpy as np
 #from .modeling_bert import BertLayerNorm as LayerNormClass
 #from .modeling_bert import BertPreTrainedModel, BertEmbeddings, BertEncoder, BertPooler
-from metro.utils.geometric_layers import orthographic_projection
+#from models.utils.geometric_layers import orthographic_projection
 
 
 class GAZEFROMBODY(torch.nn.Module):
@@ -18,12 +18,12 @@ class GAZEFROMBODY(torch.nn.Module):
         self.lstm2 = torch.nn.LSTM(input_size=3, hidden_size=20, batch_first=True)
         self.fc2 = torch.nn.Linear(20, 3)  # 予測値1つ
 
-    def forward(self, images, smpl, mesh_sampler, is_train=False, render=False):
+    def forward(self, images, is_train=False, render=False):
 
         direction = []
         mdirection = []
         for i in range(self.n_frames):
-            dir, mdir = self.BertLayer(images[:,i], smpl, mesh_sampler, is_train=True)
+            dir, mdir = self.BertLayer(images[:,i], is_train=True)
             direction.append(dir)
             mdirection.append(mdir)
 
@@ -78,13 +78,13 @@ class BertLayer(torch.nn.Module):
         return pred_3d_joints - pred_torso[:, None, :]
 
 
-    def forward(self, images, smpl, mesh_sampler, is_train=False, render=False):
+    def forward(self, images, is_train=False, render=False):
         batch_size = images.size(0)
         self.bert.eval()
         self.metromodule.eval()
 
         with torch.no_grad():
-            _, tmp_joints, _, _, _, _, _, _ = self.metromodule(images, smpl, mesh_sampler)
+            _, tmp_joints, _, _, _, _, _, _ = self.metromodule(images)
 
         #pred_joints = torch.stack(pred_joints, dim=3)
         pred_joints = self.transform_head(tmp_joints)
@@ -97,7 +97,7 @@ class BertLayer(torch.nn.Module):
         mdir = mx
 
         # metro inference
-        pred_camera, pred_3d_joints, _, _, _, _, _, _ = self.bert(images, smpl, mesh_sampler)
+        pred_camera, pred_3d_joints, _, _, _, _, _, _ = self.bert(images)
         pred_3d_joints_gaze = self.transform_head(pred_3d_joints)
         x = self.flatten(pred_3d_joints_gaze)
         x = self.encoder1(x)

@@ -13,7 +13,7 @@ from torch import nn
 # bertはGoogle製
 from .modeling_bert import BertPreTrainedModel, BertEmbeddings, BertEncoder, BertPooler
 from .modeling_bert import BertLayerNorm as LayerNormClass
-import metro.modeling.data.config as cfg
+import models.data.config as cfg
 
 class METRO_Encoder(BertPreTrainedModel):
     def __init__(self, config):
@@ -148,7 +148,7 @@ class METRO_Body_Network(torch.nn.Module):
     '''
     End-to-end METRO network for human pose and mesh reconstruction from a single image.
     '''
-    def __init__(self, args, config, backbone, trans_encoder, mesh_sampler):
+    def __init__(self, args, config, backbone, trans_encoder, mesh_smpl, mesh_sampler):
         super(METRO_Body_Network, self).__init__()
         self.config = config
         self.config.device = args.device
@@ -161,21 +161,24 @@ class METRO_Body_Network(torch.nn.Module):
         self.cam_param_fc2 = torch.nn.Linear(431, 250)
         self.cam_param_fc3 = torch.nn.Linear(250, 3)
 
-    def forward(self, images, smpl, mesh_sampler, meta_masks=None, is_train=False):
+        self.mesh_sampler = mesh_sampler
+        self.smpl = mesh_smpl
+
+    def forward(self, images, meta_masks=None, is_train=False):
         batch_size = images.size(0)
         # Generate T-pose template mesh
         template_pose = torch.zeros((1,72))
         template_pose[:,0] = 3.1416 # Rectify "upside down" reference mesh in global coord
         template_pose = template_pose.cuda(self.config.device)
         template_betas = torch.zeros((1,10)).cuda(self.config.device)
-        template_vertices = smpl(template_pose, template_betas)
+        template_vertices = self.smpl(template_pose, template_betas)
 
         # template mesh simplification
-        template_vertices_sub = mesh_sampler.downsample(template_vertices)
-        template_vertices_sub2 = mesh_sampler.downsample(template_vertices_sub, n1=1, n2=2)
+        template_vertices_sub = self.mesh_sampler.downsample(template_vertices)
+        template_vertices_sub2 = self.mesh_sampler.downsample(template_vertices_sub, n1=1, n2=2)
 
         # template mesh-to-joint regression 
-        template_3d_joints = smpl.get_h36m_joints(template_vertices)
+        template_3d_joints = self.smpl.get_h36m_joints(template_vertices)
         template_pelvis = template_3d_joints[:,cfg.H36M_J17_NAME.index('Pelvis'),:]
         template_3d_joints = template_3d_joints[:,cfg.H36M_J17_TO_J14,:]
         num_joints = template_3d_joints.shape[1]
