@@ -1,41 +1,26 @@
-"""
-Copyright (c) Microsoft Corporation.
-Licensed under the MIT license.
 
-End-to-end inference codes for 
-3D human body mesh reconstruction from an image
 
-python ./metro/tools/end2end_inference_bodymesh.py 
-       --resume_checkpoint ./models/metro_release/metro_3dpw_state_dict.bin
-       --image_file_or_path ./samples/human-body
-"""
 
 from __future__ import absolute_import, division, print_function
 import argparse
 import os
-import os.path as op
-import code
-import copy
 import time
 import datetime
 import torch
-import torchvision.models as models
-#from torchvision.utils import make_grid
+#import torchvision.models as models
 import numpy as np
-#import cv2
 from torch.utils.data import DataLoader
 from models.bert.modeling_bert import BertConfig
 from models.bert.modeling_metro import METRO_Body_Network as METRO_Network
 from models.bert.modeling_metro import METRO
-from models.bert.modeling_gabert import GAZEFROMBODY
 from models.smpl._smpl import SMPL, Mesh
 from models.hrnet.hrnet_cls_net_featmaps import get_cls_net
 from models.hrnet.config import config as hrnet_config
 from models.hrnet.config import update_config as hrnet_update_config
 from models.dataloader.gafa_loader import create_gafa_dataset
 from models.utils.logger import setup_logger
+from models.bert.modeling_gabert import GAZEFROMBODY
 from models.utils.metric_logger import AverageMeter
-from models.utils.miscellaneous import set_seed
 
 from torchvision import transforms
 
@@ -61,7 +46,11 @@ class CosLoss(torch.nn.Module):
         l2 = torch.linalg.norm(outputs, ord=2, axis=1)
         outputs = outputs/l2[:,None]
         outputs = outputs.reshape(-1, outputs.shape[-1])
+
+        l2 = torch.linalg.norm(targets, ord=2, axis=1)
+        targets = targets/l2[:,None]
         targets = targets.reshape(-1, targets.shape[-1])
+
         cos =  torch.sum(outputs*targets,dim=-1)
         cos[cos > 1] = 1
         cos[cos < -1] = -1
@@ -73,18 +62,10 @@ class CosLoss(torch.nn.Module):
 def run_test(args, test_dataloader, _gaze_network, smpl, mesh_sampler):
 
     print("len of dataset:", len(test_dataloader))
-
-    start_training_time = time.time()
-    end = time.time()
-    _gaze_network.eval()
-    #data_time = AverageMeter()
-    #log_losses = AverageMeter()
-
-    criterion_mse = CosLoss().cuda(args.device)
         
     val = run_validate(args, test_dataloader, 
                         _gaze_network, 
-                        criterion_mse,
+                        #criterion_mse,
                         smpl,
                         mesh_sampler
                         )
@@ -92,7 +73,11 @@ def run_test(args, test_dataloader, _gaze_network, smpl, mesh_sampler):
     print(args.dataset)
     print("test:", val)
 
-def run_validate(args, val_dataloader, _gaze_network, criterion_mse, smpl,mesh_sampler):
+def run_validate(args, val_dataloader, _gaze_network, smpl,mesh_sampler):
+
+
+    end = time.time()
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     log_losses = AverageMeter()
@@ -101,27 +86,37 @@ def run_validate(args, val_dataloader, _gaze_network, criterion_mse, smpl,mesh_s
     _gaze_network.eval()
     smpl.eval()
 
-    with torch.no_grad():        
+    frame = args.n_frames // 2
+
+    criterion_mse = CosLoss().cuda(args.device)
+
+    with torch.no_grad():
         for iteration, batch in enumerate(val_dataloader):
             iteration += 1
             epoch = iteration
 
-            image = batch["image"].cuda(args.device)
+            batch_imgs = batch["image"].cuda(args.device)
             gaze_dir = batch["gaze_dir"].cuda(args.device)
 
-            batch_imgs = image
-            batch_size = image.size(0)
+            #batch_imgs = image
+            batch_size = batch_imgs.size(0)
+            gaze_dir = gaze_dir[:,frame,:]
+
+            data_time.update(time.time() - end)
 
             # forward-pass
-            direction = _gaze_network(batch_imgs, smpl, mesh_sampler)
-            #print(direction.shape)
+            direction = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
+            # direction: tuple (batch, n_frames, 3)
+            #direction = direction[0]
 
-            loss = criterion_mse(direction,gaze_dir).mean()
+            loss = criterion_mse(direction, gaze_dir).mean()
 
             # update logs
             log_losses.update(loss.item(), batch_size)
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-            if(iteration%100==0):
+            if(iteration%10==0):
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 logger.info(
@@ -169,6 +164,7 @@ def parse_args():
     #########################################################
     # Others
     #########################################################
+    parser.add_argument("--n_frames", type=int, default=7)
     parser.add_argument("--device", type=str, default='cuda', 
                         help="cuda or cpu")
     parser.add_argument('--seed', type=int, default=88, 
@@ -193,7 +189,7 @@ def main(args):
     logger = setup_logger("WholeBodyGaze Test", args.output_dir, 0)
     # randomのシード
     # default=88
-    set_seed(args.seed, args.num_gpus)
+    #set_seed(args.seed, args.num_gpus)
     logger.info("Using {} GPUs".format(args.num_gpus))
 
     # Mesh and SMPL utils
@@ -325,7 +321,6 @@ def main(args):
     _gaze_network.load_state_dict(state_dict)
     del state_dict
 
-    logger.info("Run test")
     exp_names = [
         'library/1029_2', #
         'lab/1013_2',
@@ -338,7 +333,7 @@ def main(args):
     if args.dataset:
         exp_names = args.dataset
 
-    dset = create_gafa_dataset(exp_names=exp_names, test=True)
+    dset = create_gafa_dataset(exp_names=exp_names, n_frames=args.n_frames)
     #dset = create_gafa_dataset(exp_names=['data20','data23','data25'], root_dir='../MakeDataset', test=True, augumented=False)
     #dset = create_gafa_dataset(exp_names=exp_names, root_dir='data/GoTK', test=True, augumented=False)
 

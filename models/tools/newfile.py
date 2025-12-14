@@ -19,9 +19,13 @@ from models.hrnet.config import config as hrnet_config
 from models.hrnet.config import update_config as hrnet_update_config
 from models.dataloader.gafa_loader import create_gafa_dataset
 from models.bert.modeling_gabert import GAZEFROMBODY
+from models.utils.geometric_layers import rotation_matrices_from_gaze,rotation_from_two_vectors
+from models.utils.matrix_operation_layer import svd_decompose_rotations
+from models.utils.matrix_fisher_loss import GazeMFGaussianLoss, MatrixFisherKLLoss
+from models.utils.Angle_Error_loss import CosLoss, CosLossSingle
 from models.utils.metric_logger import AverageMeter
+from models.utils.miscellaneous import save_checkpoint, load_from_state_dict, create_dataset
 
-from torchvision import transforms
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -88,8 +92,14 @@ def main(args):
     args.device = torch.device(args.device)
     print(f"Using device: {args.device}")
 
+    # Mesh and SMPL utils
+    # from metro.modeling._smpl import SMPL, Mesh
+    smpl = SMPL().to(args.device)
+    mesh_sampler = Mesh()
+    smpl.eval()
+
     if 1:
-        _metro_network = load_from_state_dict(args)
+        _metro_network = load_from_state_dict(args, smpl, mesh_sampler)
     else:
         _metro_network = torch.load(args.model_metro_checkpoint, weights_only=False)
 
@@ -98,26 +108,25 @@ def main(args):
     _gaze_network = GAZEFROMBODY(args, _metro_network)
     _gaze_network.to(args.device)
 
-
+    if not args.num_init_epoch == 0:
+        state_dict = torch.load(args.model_checkpoint)
+        _gaze_network.load_state_dict(state_dict)
+        del state_dict
 
     if not args.test:
         print("Train mode")
         dset = create_dataset(args)
-        #train_idx, val_idx = np.arange(0, int(len(dset)*0.9)), np.arange(int(len(dset)*0.9), len(dset))
-        #train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
-
-        split_1 = int(len(dset)*0.9)
-        split_2 = int(len(dset)*0.1)
-        train_dset, val_dset, test_dset = random_split(dset, [split_1, split_2-split_1, len(dset)-split_2])
+        train_idx, val_idx = np.arange(0, int(len(dset)*0.9)), np.arange(int(len(dset)*0.9), len(dset))
+        train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=1, num_workers=16, pin_memory=True, shuffle=True
+            train_dset, batch_size=1, num_workers=1, pin_memory=True, shuffle=True
         )
         val_dataloader = DataLoader(
-            val_dset, batch_size=1, shuffle=False, num_workers=16, pin_memory=True
+            val_dset, batch_size=5, shuffle=False, num_workers=16, pin_memory=True
         )
         # Training
-        train(args, train_dataloader, val_dataloader, _gaze_network)
+        train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler)
 
 
 
@@ -131,63 +140,36 @@ def main(args):
 
     return 0
 
-def save_checkpoint(model, args, epoch, iteration, num_trial=10):
-    checkpoint_dir = os.path.join(args.output_dir, 'checkpoint-{}-{}'.format(
-        epoch, iteration))
-
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    model_to_save = model.module if hasattr(model, 'module') else model
-    for i in range(num_trial):
-        try:
-            torch.save(model_to_save, os.path.join(checkpoint_dir, 'model.bin'))
-            torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, 'state_dict.bin'))
-            torch.save(args, os.path.join(checkpoint_dir, 'training_args.bin'))
-            print("Save checkpoint to {}".format(checkpoint_dir))
-            break
-        except:
-            pass
-    else:
-        print("Failed to save checkpoint after {} trails.".format(num_trial))
-    return checkpoint_dir
 
 
-
-class CosLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, outputs, targets):
-        l2 = torch.linalg.norm(outputs, ord=2, axis=1)
-        outputs = outputs/l2[:,None]
-        outputs = outputs.reshape(-1, outputs.shape[-1])
-        l2 = torch.linalg.norm(targets, ord=2, axis=1)
-        targets = targets/l2[:,None]
-        targets = targets.reshape(-1, targets.shape[-1])
-        cos =  torch.sum(outputs*targets,dim=-1)
-        #cos[cos != cos] = 0
-        cos[cos > 999/1000] = 999/1000
-        cos[cos < -999/1000] = -999/1000
-        rad = torch.acos(cos)
-        loss = torch.rad2deg(rad)#0.5*(1-cos)#criterion(pred_gaze,gaze_dir)
-
-        return loss
-
-
-def train(args, train_dataloader, val_dataloader, _gaze_network):
+def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler):
     max_iter = len(train_dataloader)
     print("len of dataset:",max_iter)
 
+
+    frame = args.n_frames // 2
     epochs = args.num_train_epochs
-    optimizer = torch.optim.Adam(params=list(_gaze_network.parameters()),lr=args.lr, betas=(0.9, 0.999), weight_decay=0)
+    optimizer = torch.optim.AdamW(
+        #params=list(_gaze_network.parameters()),lr=args.lr, 
+        [
+        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
+        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
+        {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
+    ],
+        betas=(0.9, 0.999), weight_decay=0
+    )
 
     end = time.time()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     log_losses = AverageMeter()
     log_cos = AverageMeter()
-
+    log_dir = AverageMeter()
+    log_MF = AverageMeter()
 
     criterion_cos = CosLoss().cuda(args.device)
+    criterion_dir = CosLossSingle().cuda(args.device)
+    criterion_MF  = MatrixFisherKLLoss().cuda(args.device)
 
     for epoch in range(args.num_init_epoch, epochs):
         for iteration, batch in enumerate(train_dataloader):
@@ -199,33 +181,63 @@ def train(args, train_dataloader, val_dataloader, _gaze_network):
             batch_imgs = batch['image'].cuda(args.device)
             gaze_dir = batch['gaze_dir'].cuda(args.device)
             head_dir = batch["head_dir"].cuda(args.device)
+            head_mask = batch["head_mask"].cuda(args.device)
 
             batch_size = batch_imgs.size(0)
 
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = args.lr
+            #for param_group in optimizer.param_groups:
+            #    param_group["lr"] = args.lr
 
             data_time.update(time.time() - end)
 
             # forward-pass
-            direction, mdirection = _gaze_network(batch_imgs, is_train=True)
+            directions, R = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
+            #print("R :", R[0])
+            #print()
+
+            # SVD 
+            pred_F, pred_U, pred_S, pred_V, mode = svd_decompose_rotations(R)
+            
+            # compute target rotation matrices from gaze directions
+            R_target = rotation_from_two_vectors(gaze_dir)
+            #print(R[0][0], R_target[0][0])
+
+            print("NaN in R:", torch.isnan(R).any())
+            print("NaN in pred_F:", torch.isnan(pred_F).any())
+            print("NaN in pred_U:", torch.isnan(pred_U).any())
+            print("NaN in pred_S:", torch.isnan(pred_S).any())
+            print("NaN in pred_V:", torch.isnan(pred_V).any())
+            print("NaN in R_target:", torch.isnan(R_target).any())
 
             # loss
-            loss_cos = criterion_cos(direction,gaze_dir[:,(args.n_frames-1)//2]).mean()
+            loss_cos = criterion_cos(directions, gaze_dir).mean()
+            loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
+            loss_MF  = criterion_MF(pred_F, pred_S, R_target).mean()
 
+            print(loss_MF)
 
-            a = 0.7
-            loss = (a)*loss_cos # + (1-a)*loss_head
+            a = 0.5
+            b = 0.5
+            loss = (a)*loss_cos  + b*loss_dir  + loss_MF
 
             # update logs
             log_losses.update(loss.item(), batch_size)
             log_cos.update(loss_cos.item(), batch_size)
+            log_dir.update(loss_dir.item(), batch_size)
+            log_MF.update(loss_MF.item(), batch_size)
 
             # back prop
             optimizer.zero_grad()
             loss.backward() 
+            torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=1.0)
             optimizer.step()
 
+
+            for name, p in _gaze_network.named_parameters():
+                if p.grad is not None:
+                    if not torch.isfinite(p.grad).all():
+                        print("NaN grad in", name)
+                        break
             batch_time.update(time.time() - end)
             end = time.time()
 
@@ -235,7 +247,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network):
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
                 print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration},"
-                    f" loss: {log_losses.avg:.4f}, cos: {log_cos.avg:.2f}")
+                    f" loss: {log_losses.avg:.4f}, log_dir: {log_dir.avg:.2f}, log_MF: {log_MF.avg:.2f}")
 
 
         checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
@@ -244,6 +256,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network):
 
         val = validate(args, val_dataloader, 
                             _gaze_network, 
+                            smpl, 
+                            mesh_sampler
                 )
         print("val:", val)
 
@@ -251,16 +265,17 @@ def train(args, train_dataloader, val_dataloader, _gaze_network):
     return 0
 
 
-def validate(args, val_dataloader, gaze_network):
+def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
     max_iter = len(val_dataloader)
     end = time.time()
     batch_time = AverageMeter()
 
-    mse = AverageMeter()
+    #mse = AverageMeter()
+    log_losses = AverageMeter()
 
     gaze_network.eval()
-
-    criterion = CosLoss().cuda(args.device)
+    frame = args.n_frames // 2
+    criterion = CosLossSingle().cuda(args.device)
 
     with torch.no_grad():        
         for iteration, batch in enumerate(val_dataloader):
@@ -272,15 +287,17 @@ def validate(args, val_dataloader, gaze_network):
 
             batch_imgs = image
             batch_size = image.size(0)
+            gaze_dir = gaze_dir[:,frame,:]
 
             # forward-pass
-            direction, _ = gaze_network(batch_imgs)
+            direction = gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
+            direction = direction[0]
             #print(direction.shape)
 
             loss = criterion(direction,gaze_dir).mean()
 
             # update logs
-            mse.update(loss.item(), batch_size)
+            log_losses.update(loss.item(), batch_size)
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -289,139 +306,9 @@ def validate(args, val_dataloader, gaze_network):
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-                print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration}")
+                print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration}, loss: {log_losses.avg:.4f}")
 
-    return mse.avg
-
-
-
-
-def load_from_state_dict(args):
-    # Mesh and SMPL utils
-    # from metro.modeling._smpl import SMPL, Mesh
-    mesh_smpl = SMPL().to(args.device)
-    mesh_sampler = Mesh()
-
-    # load pretrained model
-    # Build model from scratch, and load weights from state_dict.bin
-    trans_encoder = []
-    # input_feat_dim default='2051,512,128'
-    input_feat_dim = [2051, 512, 128] #[int(item) for item in args.input_feat_dim.split(',')]
-    # hidden_feat_dim default='1024,256,128'
-    hidden_feat_dim = [1024, 256, 128] #[int(item) for item in args.hidden_feat_dim.split(',')]
-    output_feat_dim = input_feat_dim[1:] + [3]
-
-    # output_feat_dim default='512,128,3'
-    for i in range(len(output_feat_dim)):
-        # from metro.modeling.bert import BertConfig, METRO
-        config_class, model_class = BertConfig, METRO
-        # default='metro/modeling/bert/bert-base-uncased/'
-        config = config_class.from_pretrained(args.model_name_or_path)
-
-        config.output_attentions = False
-        config.img_feature_dim = input_feat_dim[i] 
-        config.output_feature_dim = output_feat_dim[i]
-        args.hidden_size = hidden_feat_dim[i]
-
-        # update model structure if specified in arguments
-        update_params = ['num_hidden_layers', 'hidden_size', 'num_attention_heads', 'intermediate_size']
-
-        for idx, param in enumerate(update_params):
-            arg_param = getattr(args, param)
-            config_param = getattr(config, param)
-            if arg_param > 0 and arg_param != config_param:
-                #logger.info("Update config parameter {}: {} -> {}".format(param, config_param, arg_param))
-                setattr(config, param, arg_param)
-
-        # init a transformer encoder and append it to a list
-        assert config.hidden_size % config.num_attention_heads == 0
-        # model_class = METRO
-        model = model_class(config=config) 
-        #logger.info("Init model from scratch.")
-        trans_encoder.append(model)
-
-    hrnet_yaml = 'models/hrnet/weights/cls_hrnet_w64_sgd_lr5e-2_wd1e-4_bs32_x100.yaml'
-    hrnet_checkpoint = 'models/hrnet/weights/hrnetv2_w64_imagenet_pretrained.pth'
-    hrnet_update_config(hrnet_config, hrnet_yaml)
-    backbone = get_cls_net(hrnet_config, pretrained=hrnet_checkpoint)
-    #logger.info('=> loading hrnet-v2-w64 model')
-
-    trans_encoder = torch.nn.Sequential(*trans_encoder)
-    #total_params = sum(p.numel() for p in trans_encoder.parameters())
-    #backbone_total_params = sum(p.numel() for p in backbone.parameters())
-
-
-    print(type(backbone))
-
-    _metro_network = METRO_Network(args, config, backbone, trans_encoder, mesh_smpl, mesh_sampler)
-
-    state_dict = torch.load(args.resume_checkpoint, map_location=torch.device('cpu'))
-    _metro_network.load_state_dict(state_dict, strict=False)
-    del state_dict
-
-    # update configs to enable attention outputs
-    setattr(_metro_network.trans_encoder[-1].config,'output_attentions', True)
-    setattr(_metro_network.trans_encoder[-1].config,'output_hidden_states', True)
-    _metro_network.trans_encoder[-1].bert.encoder.output_attentions = True
-    _metro_network.trans_encoder[-1].bert.encoder.output_hidden_states =  True
-    for iter_layer in range(4):
-        _metro_network.trans_encoder[-1].bert.encoder.layer[iter_layer].attention.self.output_attentions = True
-    for inter_block in range(3):
-        setattr(_metro_network.trans_encoder[-1].config,'device', args.device)
-
-
-    return _metro_network
-
-def loding_images(args):
-    image_list = []
-
-    if not args.image_file_or_path:
-        raise ValueError("image_file_or_path not specified")
-    if os.path.isfile(args.image_file_or_path):
-        image_list = [args.image_file_or_path]
-    elif os.path.isdir(args.image_file_or_path):
-        for filename in os.listdir(args.image_file_or_path):
-            if filename.endswith(".png") or filename.endswith(".jpg"):
-                image_list.append(args.image_file_or_path+'/'+filename)
-    else:
-        raise ValueError("Cannot find images at {}".format(args.image_file_or_path))
-    return image_list
-
-
-def create_dataset(args):
-    print(f"Creating dataset, is_GAFA: {args.is_GAFA}")
-    if not args.is_GAFA:
-        exp_names = [
-            'data20',
-            'data23',
-            'data25',
-            'data29_0',
-            'data29_1',
-            'data29_2',
-        ]
-        random.shuffle(exp_names)
-        # Ryukoku dataset
-        dset = create_gafa_dataset(exp_names=exp_names, root_dir='data/GoTK', n_frames=args.n_frames)
-
-    if args.is_GAFA:
-        exp_names = [
-        'living_room/005',
-        #'living_room/004',
-        #'kitchen/1015_4',
-        #'kitchen/1022_4',
-        #'library/1028_2',
-        #'library/1028_5',
-        #'library/1026_3',
-        #'courtyard/004',
-        #'courtyard/005',
-        #'lab/1013_1',
-        #'lab/1014_1',
-                    ]
-        random.shuffle(exp_names)
-        # GAFA dataset
-        dset = create_gafa_dataset(exp_names=exp_names, n_frames=args.n_frames)
-
-    return dset
+    return log_losses.avg
 
 
 
