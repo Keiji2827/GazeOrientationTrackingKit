@@ -44,6 +44,18 @@ def svd_decompose_rotations(R: torch.Tensor, device=None):
 
 
 
+def rotation_confidence_from_R(R_pred, R_gt):
+    """
+    R_pred, R_gt: (..., 3, 3)
+    return: (...) confidence
+    """
+    R_rel = R_pred.transpose(-1, -2) @ R_gt
+    cos_theta = ((R_rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1, 1)
+    theta = torch.acos(cos_theta)
+    confidence = torch.exp(-theta)   # or 1 / (theta + eps)
+    return confidence
+
+
 
 
 

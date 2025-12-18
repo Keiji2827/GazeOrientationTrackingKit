@@ -20,8 +20,8 @@ from models.hrnet.config import update_config as hrnet_update_config
 from models.dataloader.gafa_loader import create_gafa_dataset
 from models.bert.modeling_gabert import GAZEFROMBODY
 from models.utils.geometric_layers import rotation_matrices_from_gaze,rotation_from_two_vectors
-from models.utils.matrix_operation_layer import svd_decompose_rotations
-from models.utils.matrix_fisher_loss import GazeMFGaussianLoss, MatrixFisherKLLoss
+from models.utils.matrix_operation_layer import svd_decompose_rotations, rotation_confidence_from_R
+from models.utils.matrix_fisher_loss import SO3GeodesicLoss, MatrixFisherKLLoss, GazeMFGaussianLoss, matrix_fisher_nll
 from models.utils.Angle_Error_loss import CosLoss, CosLossSingle
 from models.utils.metric_logger import AverageMeter
 from models.utils.miscellaneous import save_checkpoint, load_from_state_dict, create_dataset
@@ -120,10 +120,10 @@ def main(args):
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=1, num_workers=1, pin_memory=True, shuffle=True
+            train_dset, batch_size=4, num_workers=1, pin_memory=True, shuffle=True
         )
         val_dataloader = DataLoader(
-            val_dset, batch_size=5, shuffle=False, num_workers=16, pin_memory=True
+            val_dset, batch_size=24, shuffle=False, num_workers=16, pin_memory=True
         )
         # Training
         train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -152,8 +152,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     optimizer = torch.optim.AdamW(
         #params=list(_gaze_network.parameters()),lr=args.lr, 
         [
-        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
-        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
+        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr * 0.1 },
+        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 },
         {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
     ],
         betas=(0.9, 0.999), weight_decay=0
@@ -162,17 +162,22 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     end = time.time()
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    log_losses = AverageMeter()
-    log_cos = AverageMeter()
-    log_dir = AverageMeter()
-    log_MF = AverageMeter()
 
-    criterion_cos = CosLoss().cuda(args.device)
+    criterion_seq = CosLoss().cuda(args.device)
     criterion_dir = CosLossSingle().cuda(args.device)
-    criterion_MF  = MatrixFisherKLLoss().cuda(args.device)
+    #criterion_Rot = matrix_fisher_nll().cuda(args.device)
+    criterion_Rot  = SO3GeodesicLoss().cuda(args.device)
 
     for epoch in range(args.num_init_epoch, epochs):
+        log_losses = AverageMeter()
+        log_seq = AverageMeter()
+        log_dir = AverageMeter()
+        log_Rot = AverageMeter()
+        log_MF = AverageMeter()
         for iteration, batch in enumerate(train_dataloader):
+
+
+            log_con = AverageMeter()
 
             iteration += 1
             _gaze_network.train()
@@ -180,8 +185,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             batch_imgs = batch['image'].cuda(args.device)
             gaze_dir = batch['gaze_dir'].cuda(args.device)
-            head_dir = batch["head_dir"].cuda(args.device)
-            head_mask = batch["head_mask"].cuda(args.device)
+            #head_dir = batch["head_dir"].cuda(args.device)
+            #head_mask = batch["head_mask"].cuda(args.device)
 
             batch_size = batch_imgs.size(0)
 
@@ -191,40 +196,38 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             data_time.update(time.time() - end)
 
             # forward-pass
-            directions, R = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
-            #print("R :", R[0])
-            #print()
+            directions, R_mode, S_diag, pred_F = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
 
-            # SVD 
-            pred_F, pred_U, pred_S, pred_V, mode = svd_decompose_rotations(R)
-            
+            confidence = S_diag.sum(dim=-1).detach()
+            confidence = confidence / (confidence.max() + 1e-8)
+            #print(confidence.mean())
+            #confidence = 1.0 + confidence
+
             # compute target rotation matrices from gaze directions
             R_target = rotation_from_two_vectors(gaze_dir)
-            #print(R[0][0], R_target[0][0])
 
-            print("NaN in R:", torch.isnan(R).any())
-            print("NaN in pred_F:", torch.isnan(pred_F).any())
-            print("NaN in pred_U:", torch.isnan(pred_U).any())
-            print("NaN in pred_S:", torch.isnan(pred_S).any())
-            print("NaN in pred_V:", torch.isnan(pred_V).any())
-            print("NaN in R_target:", torch.isnan(R_target).any())
 
             # loss
-            loss_cos = criterion_cos(directions, gaze_dir).mean()
+            loss_seq = criterion_seq(directions, gaze_dir).mean()
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
-            loss_MF  = criterion_MF(pred_F, pred_S, R_target).mean()
-
-            print(loss_MF)
+            loss_Rot = criterion_Rot(R_mode, R_target).mean()
+            loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
+            #loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).detach().mean()
 
             a = 0.5
             b = 0.5
-            loss = (a)*loss_cos  + b*loss_dir  + loss_MF
-
+            c = 0.3
+            d = 0.01
+            loss = ((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
+            #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
+            loss = loss.mean()
             # update logs
             log_losses.update(loss.item(), batch_size)
-            log_cos.update(loss_cos.item(), batch_size)
-            log_dir.update(loss_dir.item(), batch_size)
+            log_seq.update(torch.rad2deg(loss_seq).item(), batch_size)
+            log_dir.update(torch.rad2deg(loss_dir).item(), batch_size)
+            log_Rot.update(torch.rad2deg(loss_Rot).item(), batch_size)
             log_MF.update(loss_MF.item(), batch_size)
+            log_con.update(confidence.mean().item(), batch_size)
 
             # back prop
             optimizer.zero_grad()
@@ -232,23 +235,20 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=1.0)
             optimizer.step()
 
-
-            for name, p in _gaze_network.named_parameters():
-                if p.grad is not None:
-                    if not torch.isfinite(p.grad).all():
-                        print("NaN grad in", name)
-                        break
             batch_time.update(time.time() - end)
             end = time.time()
 
-
             if iteration%args.logging_steps == 0 or iteration == max_iter:
+                now = datetime.datetime.now().strftime("%m-%d %H:%M:%S")
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-                print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration},"
-                    f" loss: {log_losses.avg:.4f}, log_dir: {log_dir.avg:.2f}, log_MF: {log_MF.avg:.2f}")
-
+                print(
+                    f"date: {now},"
+                    f"eta: {eta_string}, epoch: {epoch}, iter: {iteration},"
+                    f" loss: {log_losses.avg:.4f}, log_angle: {(log_dir.avg+log_seq.avg)/2:.2f},"
+                    f" log_Rot: {log_Rot.avg:.2f}, log_MF: {log_MF.avg:.2f},"
+                    f" confidence: {log_con.avg:.6f}")
 
         checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
         print("save trained model at ", checkpoint_dir)
@@ -259,7 +259,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                             smpl, 
                             mesh_sampler
                 )
-        print("val:", val)
+        print("val:", torch.rad2deg(val))
 
 
     return 0
@@ -290,8 +290,7 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
             gaze_dir = gaze_dir[:,frame,:]
 
             # forward-pass
-            direction = gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
-            direction = direction[0]
+            direction, S_diag = gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
             #print(direction.shape)
 
             loss = criterion(direction,gaze_dir).mean()

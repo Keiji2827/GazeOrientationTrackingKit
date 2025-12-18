@@ -115,13 +115,13 @@ def skew(v):
 def rotation_from_two_vectors(gaze_dir, eps=1e-6):
 
     # 正規化
-    gaze_dir = gaze_dir / gaze_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    gaze_dir = gaze_dir / gaze_dir.norm(dim=-1, keepdim=True).clamp(min=eps)
 
     a = gaze_dir[:, :-1, :]  # (batch, n_frames-1, 3)
     b = gaze_dir[:, 1:, :]   # (batch, n_frames-1, 3)
 
-    a = a / a.norm(dim=-1, keepdim=True)
-    b = b / b.norm(dim=-1, keepdim=True)
+    #a = a / a.norm(dim=-1, keepdim=True)
+    #b = b / b.norm(dim=-1, keepdim=True)
 
     v = torch.cross(a, b, dim=-1)
     c = (a * b).sum(dim=-1, keepdim=True)         # (B, F-1, 1)
@@ -137,10 +137,10 @@ def rotation_from_two_vectors(gaze_dir, eps=1e-6):
 
 
 # --- 使用例 ---
-batch_size, n_frames = 2, 5
-gaze_dir = torch.randn(batch_size, n_frames, 3)
-R = rotation_matrices_from_gaze(gaze_dir)
-print(R.shape)  # (2, 4, 3, 3)
+#batch_size, n_frames = 2, 5
+#gaze_dir = torch.randn(batch_size, n_frames, 3)
+#R = rotation_matrices_from_gaze(gaze_dir)
+#print(R.shape)  # (2, 4, 3, 3)
 
 
 

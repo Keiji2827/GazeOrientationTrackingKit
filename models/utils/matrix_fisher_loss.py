@@ -193,7 +193,38 @@ class LogMFNormConstant(torch.autograd.Function):
         return grad_S.view(-1, 3)
 
 
+
+
 def matrix_fisher_nll(pred_F,
+                      R_mode,   # 単一の直交行列 (U V^T)
+                      S_diag,   # (N, 3) 対角成分
+                      R_target,
+                      overreg=1.025):
+
+
+    # flatten batch and frames
+    N = R_mode.shape[0] * R_mode.shape[1]
+    pred_F = pred_F.view(N, 3, 3)
+    R_mode = R_mode.view(N, 3, 3)
+    S_diag = S_diag.view(N, 3)
+    R_target = R_target.view(N, 3, 3)
+
+    # Proper singular values を計算
+    with torch.no_grad():
+        s3sign = torch.det(R_mode.detach().cpu()).to(S_diag.device)  # det(UV^T) = ±1
+    pred_S_proper = S_diag.clone()
+    pred_S_proper[..., 2] *= s3sign
+
+    # 正規化定数
+    log_norm_constant = LogMFNormConstant.apply(pred_S_proper)
+
+    # 尤度項
+    log_exponent = -torch.matmul(pred_F.view(-1, 1, 9), R_target.view(-1, 9, 1)).view(-1)
+
+    return log_exponent + overreg * log_norm_constant
+
+
+def matrix_fisher_nll_old(pred_F,
                       pred_U,
                       pred_S,
                       pred_V,
@@ -242,35 +273,102 @@ class GazeMFGaussianLoss(nn.Module):
         super(GazeMFGaussianLoss, self).__init__()
 
 
-    def forward(self, target_dict, pred_dict):
+    def forward(self, pred_F, pred_U, pred_S, pred_V, target_R):
 
         # Gaze NLL
-        gaze_nll = matrix_fisher_nll(pred_F=pred_dict['params_F'],
-                                     pred_U=pred_dict['params_U'],
-                                     pred_S=pred_dict['params_S'],
-                                     pred_V=pred_dict['params_V'],
-                                     target_R=target_dict['params_rotmats']
+        gaze_nll = matrix_fisher_nll(pred_F=pred_F,
+                                     pred_U=pred_U,
+                                     pred_S=pred_S,
+                                     pred_V=pred_V,
+                                     target_R=target_R
                                      )
-
-        #gaze_nll = torch.mean(gaze_nll)
-        #batch_size = target_dict['params_rotmats'].size(0)
-        #return torch.ones(batch_size, device=target_dict['params_rotmats'].device)
 
         return gaze_nll
     
 
-class MatrixFisherKLLoss(nn.Module):
-    def __init__(self, kl_weight=1e-1):
+class MatrixFisherKLLoss_dummy(nn.Module):
+    def __init__(self, kl_weight=1e-3):
         super().__init__()
         self.kl_weight = kl_weight
 
-    def forward(self, pred_F, pred_S, target_R):
+    def forward(self, pred_F, pred_U, pred_S, pred_V, target_R):
         pred_F = pred_F.view(-1, 3, 3)
         target_R = target_R.view(-1, 3, 3)
-        pred_S = torch.clamp(pred_S, -10.0, 10.0)
-        pred_S = pred_S.view(-1, 3)
+        pred_S = torch.clamp(pred_S, -10.0, 10.0).view(-1, 3)
 
+        # data term
         loss_data = -torch.einsum('bij,bij->b', pred_F, target_R)
-        loss_kl   = self.kl_weight * torch.sum(pred_S ** 2 + 1e-6, dim=1)
-        print(loss_data.shape, loss_kl.shape)
+        # KL regularization term
+        loss_kl   = self.kl_weight * torch.sum(pred_S ** 2, dim=1)
+        #print(loss_data.shape, loss_kl.shape)
         return loss_data + loss_kl
+    
+
+class MatrixFisherKLLoss(nn.Module):
+    def __init__(self, kl_weight=1e-3):
+        super().__init__()
+        self.kl_weight = kl_weight
+
+    def forward(self, pred_F, pred_U, pred_S, pred_V, target_R):
+        mode = target_R.detach().view(-1, 3, 3)
+        target_R = target_R.view(-1, 3, 3)
+        pred_S = torch.clamp(pred_S, -10, 10).view(-1, 3)
+
+        loss_data = -torch.einsum('bij,bij->b', mode, target_R)
+        loss_kl = self.kl_weight * torch.sum(pred_S ** 2, dim=1)
+
+        return loss_data + loss_kl
+
+
+class SO3GeodesicLoss(nn.Module):
+    """
+    Geodesic loss on SO(3):
+        d(R1, R2) = acos((tr(R1^T R2) - 1) / 2)
+
+    - fully differentiable
+    - numerically stable
+    - no SVD
+    """
+
+    def __init__(self, eps=1e-6, reduction="mean"):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, R_pred, R_gt):
+        """
+        Args:
+            R_pred: (..., 3, 3)
+            R_gt:   (..., 3, 3)
+
+        Returns:
+            loss: scalar or (...) depending on reduction
+        """
+        # relative rotation
+        R_rel = R_pred.transpose(-1, -2) @ R_gt
+
+        # trace
+        trace = (
+            R_rel[..., 0, 0]
+            + R_rel[..., 1, 1]
+            + R_rel[..., 2, 2]
+        )
+
+        # cos(theta)
+        cos_theta = (trace - 1.0) * 0.5
+        cos_theta = torch.clamp(
+            cos_theta,
+            -1.0 + self.eps,
+            1.0 - self.eps
+        )
+
+        theta = torch.acos(cos_theta)
+
+        if self.reduction == "mean":
+            return theta.mean()
+        elif self.reduction == "sum":
+            return theta.sum()
+        elif self.reduction == "none":
+            return theta
+        else:
+            raise ValueError(f"Unknown reduction: {self.reduction}")

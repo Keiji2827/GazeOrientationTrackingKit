@@ -22,7 +22,8 @@ class CosLoss(torch.nn.Module):
         cos = torch.clamp(cos, min=-0.999, max=0.999)
 
         rad = torch.acos(cos) # batch, frames
-        loss = torch.rad2deg(rad) # batch, frames
+        #loss = torch.rad2deg(rad) # batch, frames
+        loss = rad
 
         return loss.mean()
 
@@ -44,7 +45,8 @@ class CosLossSingle(torch.nn.Module):
         cos[cos > 1] = 1
         cos[cos < -1] = -1
         rad = torch.acos(cos)
-        loss = torch.rad2deg(rad)#0.5*(1-cos)#criterion(pred_gaze,gaze_dir)
+        #loss = torch.rad2deg(rad)#0.5*(1-cos)#criterion(pred_gaze,gaze_dir)
+        loss = rad
 
         return loss
 
