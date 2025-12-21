@@ -26,51 +26,95 @@ class GAZEFROMBODY(torch.nn.Module):
         if is_train == False:
             return dirs[:,self.n_frames//2,:], S_diag#, pred_vertices, pred_camera
 
+
+def cumulative_matmul(R):
+    B, N, _, _ = R.shape
+    outs = []
+
+    cur = R[:, 0]
+    outs.append(cur)
+
+    for i in range(1, N):
+        cur = cur @ R[:, i]
+        outs.append(cur)
+
+    return torch.stack(outs, dim=1)
+
 class GazeLSTM(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
         self.n_frames = args.n_frames
+        # ✅ batch_first=False に戻す（元コードと同じ）
         self.lstm = nn.LSTM(input_size=3, hidden_size=3, batch_first=False)
 
     def forward(self, dir, R_mode, S_diag, is_train=False):
         """
-        dir: (batch, 3) 基準方向（中心フレームなど）
-        R, R_mode: (batch, n_frames-1, 3, 3)
-        S_diag: (batch, n_frames-1, 3)
-        return: directions: (batch, n_frames, 3)
+        dir: (batch, 3)
+        R_mode: (batch, n_frames-1, 3, 3)
         """
+        B, Tm1, _, _ = R_mode.shape
+        T = Tm1 + 1
+        half = T // 2
+
+        # ============================
+        # forward cumulative rotations
+        # ============================
+        R_fwd = cumulative_matmul(R_mode[:, half:])  # (B, T-half-1, 3, 3)
+
+        # ============================
+        # backward cumulative rotations
+        # ============================
+        R_bwd = cumulative_matmul(
+            R_mode[:, :half].transpose(2,3).flip(1)
+        )  # (B, half, 3, 3)
 
         dirs = []
-        half = self.n_frames//2 # When n_frames is 7, half = 3 
-        for i in range(half): # 0,1,2
-            x = dir.unsqueeze(-1)  # (batch, 3, 1)
-            for j in range(half-1, half -1 - i -1, -1):
-                x = torch.matmul(R_mode[:,j].transpose(1,2), x)  # (batch, 3, 1)
-            dirs.append(x.squeeze(-1))  # (batch, 3)
 
-        dirs.append(dir)  # (batch, 3)
+        # past
+        if half > 0:
+            d_past = torch.matmul(
+                R_bwd,
+                dir[:, None, :, None]
+            ).squeeze(-1)  # (B, half, 3)
+            dirs.append(d_past.flip(1))
 
-        for i in range(half+1, self.n_frames):
-            x = dir.unsqueeze(-1)  # (batch, 3, 1)
-            for j in range(half, i):
-                x = torch.matmul(R_mode[:,j], x)  # (batch, 3, 1)
-            dirs.append(x.squeeze(-1))  # (batch, 3)
+        # center
+        dirs.append(dir[:, None, :])  # (B, 1, 3)
 
-        # dirs をテンソル化 (batch, n_frames, 3)
-        dirs = torch.stack(dirs, dim=1)
+        # future
+        if T - half - 1 > 0:
+            d_fut = torch.matmul(
+                R_fwd,
+                dir[:, None, :, None]
+            ).squeeze(-1)  # (B, T-half-1, 3)
+            dirs.append(d_fut)
 
-        dirs_out = dirs.clone()
+        # (B, T, 3)
+        dirs = torch.cat(dirs, dim=1)
 
-        # LSTM 入力形式に変換 (n_frames, batch, 3)
-        dirs = dirs.transpose(0, 1)
+        # ============================
+        # LSTM（元コードと同じ動作）
+        # ============================
 
-        # LSTM 適用
-        lstm_out, _ = self.lstm(dirs)  # (n_frames, batch, 3)
+        # ✅ (B, T, 3) → (T, B, 3)
+        dirs_lstm_in = dirs.transpose(0, 1)
 
-        # 出力を (batch, n_frames, 3) に戻す
+        lstm_out, _ = self.lstm(dirs_lstm_in)  # (T, B, 3)
+
+        # ✅ (T, B, 3) → (B, T, 3)
         lstm_out = lstm_out.transpose(0, 1)
 
-        dirs_out[:, half, :] = lstm_out[:, half, :]
+        # ✅ 中心フレームだけ置き換える（元コードと同じ）
+        dirs_out = dirs.clone()
+
+        # ✅ in-place を避ける
+        center = lstm_out[:, half, :].unsqueeze(1)  # (B,1,3)
+
+        dirs_out = torch.cat([
+            dirs_out[:, :half, :],
+            center,
+            dirs_out[:, half+1:, :]
+        ], dim=1)
 
         return dirs_out
 
@@ -161,45 +205,43 @@ class HeadMFLayer(torch.nn.Module):
 
 
     def forward(self, images, is_train=False):
-        #n_batch, n_channel, h, w = image.shape
-        #image = image.reshape(n_batch, n_channel, h, w)
-        features = []
-        # extract low-level features
-        #for i in range(self.n_frames):
-            #R = self.HeadMFLayer(images[:,i], is_train=True)
-        #    feature = self.feature_extractor(images[:,i])
-        #    features.append(feature)
+        B, T, C, H, W = images.shape
+        device = images.device
 
-        batch_size = images.size(0)
-        R_mode_list = []
-        S_diag_list = []
-        F_list = []
+        # ============================================================
+        # ✅ 1. EfficientNetShallow をフレームごとに1回だけ実行
+        # ============================================================
+        images_flat = images.reshape(B * T, C, H, W)
+        feats_flat = self.encoder(images_flat)  # (B*T, C', H', W')
+        C2, H2, W2 = feats_flat.shape[1:]
+        feats = feats_flat.reshape(B, T, C2, H2, W2)
 
-        for i in range(self.n_frames-1):
+        # ============================================================
+        # ✅ 2. correlation_volume をベクトル化（ループなし）
+        # ============================================================
+        feat1 = feats[:, :-1]      # (B, T-1, C2, H2, W2)
+        feat2 = feats[:, 1:]       # (B, T-1, C2, H2, W2)
 
-            feat1 = self.encoder(images[:,i])  # (batch, C, H, W)
-            feat2 = self.encoder(images[:,i+1])  # (batch, C, H, W)
-            corr = correlation_volume(feat1, feat2)  # (batch, 1, H, W)
-            feat = corr.view(corr.size(0), -1)  # (batch, H*W)
+        corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
+        corr = corr.reshape(B, T-1, -1)                  # (B, T-1, H2*W2)
 
-            # --- R_mode 推定 ---
-            q_mode = self.mlp_quat(feat)  # (batch, 4)
-            q_mode = q_mode.squeeze(-1)  # (batch, 4)
-            q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            R_mode = quaternion_to_rotation_matrix(q_mode)
-            R_mode_list.append(R_mode)
+        # ============================================================
+        # ✅ 3. MLP を一括処理（ループなし）
+        # ============================================================
+        corr_flat = corr.reshape(B * (T-1), -1)
 
-            # --- 精度パラメータ S ---
-            S_diag = F.softplus(self.mlp_S(feat))  # (batch, 3)
-            S_diag_list.append(S_diag)
+        q_mode = self.mlp_quat(corr_flat)  # (B*(T-1), 4)
+        q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        R_mode = quaternion_to_rotation_matrix(q_mode)
+        R_mode = R_mode.reshape(B, T-1, 3, 3)
 
-            # --- F 行列の構築 ---
-            F_mat = R_mode @ torch.diag_embed(S_diag)
-            F_list.append(F_mat)
+        S_diag = F.softplus(self.mlp_S(corr_flat))
+        S_diag = S_diag.reshape(B, T-1, 3)
 
-        R_mode = torch.stack(R_mode_list, dim=1)
-        S_diag = torch.stack(S_diag_list, dim=1)
-        F_mat = torch.stack(F_list, dim=1)
+        # ============================================================
+        # ✅ 4. F_mat も一括処理
+        # ============================================================
+        F_mat = R_mode @ torch.diag_embed(S_diag)
 
         return R_mode, S_diag, F_mat
 
