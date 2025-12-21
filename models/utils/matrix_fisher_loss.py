@@ -221,8 +221,17 @@ def matrix_fisher_nll(pred_F,
     # 尤度項
     log_exponent = -torch.matmul(pred_F.view(-1, 1, 9), R_target.view(-1, 9, 1)).view(-1)
 
-    return log_exponent + overreg * log_norm_constant
+    #return log_exponent + overreg * log_norm_constant
+    loss = log_exponent + overreg * log_norm_constant
+    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+    if torch.isnan(loss).any():
+        print("Warning: NaN detected in loss and replaced with 0.")
 
+    loss = torch.where(torch.isinf(loss), torch.zeros_like(loss), loss)
+    if torch.isinf(loss).any():
+        print("Warning: Inf detected in loss and replaced with 0.")
+
+    return loss
 
 def matrix_fisher_nll_old(pred_F,
                       pred_U,
