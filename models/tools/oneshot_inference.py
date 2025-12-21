@@ -33,7 +33,7 @@ import models.data.config as cfg
 from models.utils.renderer import Renderer, visualize_reconstruction_no_text, visualize_reconstruction
 from metro.utils.geometric_layers import orthographic_projection
 from models.utils.logger import setup_logger
-from models.utils.miscellaneous import set_seed
+#from models.utils.miscellaneous import set_seed
 
 from PIL import Image
 from torchvision import transforms

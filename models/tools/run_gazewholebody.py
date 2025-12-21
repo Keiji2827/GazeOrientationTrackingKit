@@ -19,8 +19,6 @@ from models.hrnet.hrnet_cls_net_featmaps import get_cls_net
 from models.dataloader.gafa_loader import create_gafa_dataset
 from models.utils.logger import setup_logger
 from models.utils.metric_logger import AverageMeter
-from models.utils.miscellaneous import mkdir
-from models.utils.loss import  compute_basic_cos_loss, compute_kappa_vMF3_loss
 
 from PIL import Image
 from torchvision import transforms
