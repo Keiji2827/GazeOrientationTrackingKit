@@ -22,7 +22,7 @@ class GAZEFROMBODY(torch.nn.Module):
         dirs = self.LSTMlayer(dir, R_mode, S_diag, is_train=True)
 
         if is_train == True:
-            return dirs, R_mode, S_diag, F_mat
+            return dirs, mdir, R_mode, S_diag, F_mat
         if is_train == False:
             return dirs[:,self.n_frames//2,:], S_diag#, pred_vertices, pred_camera
 
@@ -191,6 +191,11 @@ class RotationMLP(nn.Module):
             q = q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
         return q
 
+def debug_check_tensors(**tensors):
+    for name, t in tensors.items():
+        if not torch.isfinite(t).all():
+            print(f"Non-finite in {name}: nan={torch.isnan(t).any().item()}, inf={torch.isinf(t).any().item()}, min={t.min().item()}, max={t.max().item()}")
+
 
 class HeadMFLayer(torch.nn.Module):
     def __init__(self, args):
@@ -208,11 +213,17 @@ class HeadMFLayer(torch.nn.Module):
         B, T, C, H, W = images.shape
         device = images.device
 
+
+        debug_check_tensors(images=images)
+        #print("images dtype:", images.dtype)
+        #print("images min/max:", images.min().item(), images.max().item())
+
         # ============================================================
         # ✅ 1. EfficientNetShallow をフレームごとに1回だけ実行
         # ============================================================
         images_flat = images.reshape(B * T, C, H, W)
         feats_flat = self.encoder(images_flat)  # (B*T, C', H', W')
+        debug_check_tensors(feats_flat=feats_flat)
         C2, H2, W2 = feats_flat.shape[1:]
         feats = feats_flat.reshape(B, T, C2, H2, W2)
 
@@ -223,19 +234,32 @@ class HeadMFLayer(torch.nn.Module):
         feat2 = feats[:, 1:]       # (B, T-1, C2, H2, W2)
 
         corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
+        corr = torch.clamp(corr, min=-50.0, max=50.0)
+        debug_check_tensors(corr=corr)
         corr = corr.reshape(B, T-1, -1)                  # (B, T-1, H2*W2)
 
         # ============================================================
         # ✅ 3. MLP を一括処理（ループなし）
         # ============================================================
         corr_flat = corr.reshape(B * (T-1), -1)
+        debug_check_tensors(corr_flat=corr_flat)
+
 
         q_mode = self.mlp_quat(corr_flat)  # (B*(T-1), 4)
+        debug_check_tensors(q_mode=q_mode)
+
         q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8)
         R_mode = quaternion_to_rotation_matrix(q_mode)
+        debug_check_tensors(R_mode=R_mode)
+
         R_mode = R_mode.reshape(B, T-1, 3, 3)
 
+        # --- S ---------------------------------------------------
         S_diag = F.softplus(self.mlp_S(corr_flat))
+        debug_check_tensors(S_diag=S_diag)
+
+        s_max = 8.0                           # ← 推奨上限
+        S_diag = torch.clamp(S_diag, max=s_max)
         S_diag = S_diag.reshape(B, T-1, 3)
 
         # ============================================================
