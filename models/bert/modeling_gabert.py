@@ -120,23 +120,27 @@ class GazeLSTM(torch.nn.Module):
 
 
 # --------------------------------------------
-# EfficientNet-B0 Shallow Feature Extractor
+# ResNet-18 Shallow Feature Extractor（安全版）
 # --------------------------------------------
-class EfficientNetShallow(nn.Module):
+class ResNetShallow(nn.Module):
     def __init__(self):
         super().__init__()
-        net = models.efficientnet_b0(
-            weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
+        net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+        # conv1(stride2) -> bn1 -> relu -> maxpool(stride2) -> layer1 -> layer2
+        # 入力 224 のとき: 224 -> 112 -> 56 -> 56 -> 28 -> 28 (stride 8)
+        self.features = nn.Sequential(
+            net.conv1,
+            net.bn1,
+            net.relu,
+            net.maxpool,  # 56x56
+            net.layer1,   # 56x56
+            net.layer2,   # 28x28
         )
-        # 最初の浅い block のみ使用（最軽量）
-        # features[:4] → stride 8 程度
-        self.features = nn.Sequential(*list(net.features[:4]))
-        self.out_channels = 40  # stage 3 output channels (EfficientNet-B0 spec)
+        self.out_channels = 128  # resnet18 layer2 の出力チャネル数
 
     def forward(self, x):
-
-        return self.features(x)  # (B, C=40, H/8, W/8)
-
+        return self.features(x)  # (B, 128, 28, 28)
 
 # --------------------------------------------
 # Correlation Volume (lightweight)
@@ -201,7 +205,11 @@ class HeadMFLayer(torch.nn.Module):
     def __init__(self, args):
         super(HeadMFLayer, self).__init__()
         self.n_frames = args.n_frames
-        self.encoder = EfficientNetShallow()
+        # EfficientNet -> ResNetShallow に変更
+        self.encoder = ResNetShallow()
+        #for p in self.encoder.parameters():
+        #    p.requires_grad = False
+
         self.h = 28
         self.w = 28
         # Flatten correlation volume → MLP
@@ -219,7 +227,7 @@ class HeadMFLayer(torch.nn.Module):
         #print("images min/max:", images.min().item(), images.max().item())
 
         # ============================================================
-        # ✅ 1. EfficientNetShallow をフレームごとに1回だけ実行
+        # ✅ 1. ResNetShallow をフレームごとに1回だけ実行
         # ============================================================
         images_flat = images.reshape(B * T, C, H, W)
         feats_flat = self.encoder(images_flat)  # (B*T, C', H', W')
@@ -234,7 +242,7 @@ class HeadMFLayer(torch.nn.Module):
         feat2 = feats[:, 1:]       # (B, T-1, C2, H2, W2)
 
         corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
-        corr = torch.clamp(corr, min=-50.0, max=50.0)
+        corr = torch.clamp(corr, min=-10.0, max=10.0)
         debug_check_tensors(corr=corr)
         corr = corr.reshape(B, T-1, -1)                  # (B, T-1, H2*W2)
 
