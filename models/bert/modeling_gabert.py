@@ -18,11 +18,11 @@ class GAZEFROMBODY(torch.nn.Module):
 
         dir, mdir = self.BertLayer(images[:,self.n_frames//2], smpl, mesh_sampler, is_train=True)
 
-        R_mode, S_diag, F_mat = self.HeadMFLayer(images, is_train=True)
+        R_mode, S_diag, F_mat, d_corr = self.HeadMFLayer(images, is_train=True)
         dirs = self.LSTMlayer(dir, R_mode, S_diag, is_train=True)
 
         if is_train == True:
-            return dirs, mdir, R_mode, S_diag, F_mat
+            return dirs, mdir, R_mode, S_diag, F_mat, d_corr
         if is_train == False:
             return dirs[:,self.n_frames//2,:], S_diag#, pred_vertices, pred_camera
 
@@ -120,27 +120,23 @@ class GazeLSTM(torch.nn.Module):
 
 
 # --------------------------------------------
-# ResNet-18 Shallow Feature Extractor（安全版）
+# EfficientNet-B0 Shallow Feature Extractor
 # --------------------------------------------
-class ResNetShallow(nn.Module):
+class EfficientNetShallow(nn.Module):
     def __init__(self):
         super().__init__()
-        net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-        # conv1(stride2) -> bn1 -> relu -> maxpool(stride2) -> layer1 -> layer2
-        # 入力 224 のとき: 224 -> 112 -> 56 -> 56 -> 28 -> 28 (stride 8)
-        self.features = nn.Sequential(
-            net.conv1,
-            net.bn1,
-            net.relu,
-            net.maxpool,  # 56x56
-            net.layer1,   # 56x56
-            net.layer2,   # 28x28
+        net = models.efficientnet_b0(
+            weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
         )
-        self.out_channels = 128  # resnet18 layer2 の出力チャネル数
+        # 最初の浅い block のみ使用（最軽量）
+        # features[:4] → stride 8 程度
+        self.features = nn.Sequential(*list(net.features[:4]))
+        self.out_channels = 40  # stage 3 output channels (EfficientNet-B0 spec)
 
     def forward(self, x):
-        return self.features(x)  # (B, 128, 28, 28)
+
+        return self.features(x)  # (B, C=40, H/8, W/8)
+
 
 # --------------------------------------------
 # Correlation Volume (lightweight)
@@ -205,11 +201,7 @@ class HeadMFLayer(torch.nn.Module):
     def __init__(self, args):
         super(HeadMFLayer, self).__init__()
         self.n_frames = args.n_frames
-        # EfficientNet -> ResNetShallow に変更
-        self.encoder = ResNetShallow()
-        #for p in self.encoder.parameters():
-        #    p.requires_grad = False
-
+        self.encoder = EfficientNetShallow()
         self.h = 28
         self.w = 28
         # Flatten correlation volume → MLP
@@ -227,7 +219,7 @@ class HeadMFLayer(torch.nn.Module):
         #print("images min/max:", images.min().item(), images.max().item())
 
         # ============================================================
-        # ✅ 1. ResNetShallow をフレームごとに1回だけ実行
+        # ✅ 1. EfficientNetShallow をフレームごとに1回だけ実行
         # ============================================================
         images_flat = images.reshape(B * T, C, H, W)
         feats_flat = self.encoder(images_flat)  # (B*T, C', H', W')
@@ -240,9 +232,11 @@ class HeadMFLayer(torch.nn.Module):
         # ============================================================
         feat1 = feats[:, :-1]      # (B, T-1, C2, H2, W2)
         feat2 = feats[:, 1:]       # (B, T-1, C2, H2, W2)
-
-        corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
-        corr = torch.clamp(corr, min=-10.0, max=10.0)
+        feat1_n = F.normalize(feat1, p=2, dim=2, eps=1e-8)
+        feat2_n = F.normalize(feat2, p=2, dim=2, eps=1e-8)
+        corr = (feat1_n * feat2_n).sum(dim=2, keepdim=True)  # in [-1, 1]
+        #corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
+        #corr = torch.clamp(corr, min=-20.0, max=20.0)
         debug_check_tensors(corr=corr)
         corr = corr.reshape(B, T-1, -1)                  # (B, T-1, H2*W2)
 
@@ -275,7 +269,7 @@ class HeadMFLayer(torch.nn.Module):
         # ============================================================
         F_mat = R_mode @ torch.diag_embed(S_diag)
 
-        return R_mode, S_diag, F_mat
+        return R_mode, S_diag, F_mat, corr
 
 class BertLayer(torch.nn.Module):
     def __init__(self, args, bert):
@@ -316,7 +310,7 @@ class BertLayer(torch.nn.Module):
 
     def forward(self, images, smpl, mesh_sampler, is_train=False):
         batch_size = images.size(0)
-        self.bert.eval()
+        #self.bert.train()
         self.metromodule.eval()
 
         with torch.no_grad():

@@ -11,37 +11,25 @@ bessel0_exp_scaled_coeffs_a = [1.0, 3.5156229, 3.0899424, 1.2067492, 0.2659732, 
 bessel0_exp_scaled_coeffs_b = [0.39894228, 0.1328592e-1, 0.225319e-2, -0.157565e-2, 0.916281e-2, -0.2057706e-1, 0.2635537e-1, -0.1647633e-1, 0.392377e-2][::-1]
 
 
-def horners_method(coeffs,
-                   x):
-    """
-    Horner's method of evaluating a polynomial with coefficients given by coeffs and
-    input x.
-    z = arr[0] + arr[1]x + arr[2]x^2 + ... + arr[n]x^n
-    :param coeffs: List/Tensor of coefficients of polynomial (in standard form)
-    :param x: Tensor of input values.
-    :return z: Tensor of output values, same shape as x.
-    """
+def horners_method(coeffs, x):
     z = torch.empty(x.shape, dtype=x.dtype, device=x.device).fill_(coeffs[0])
     for i in range(1, len(coeffs)):
         z.mul_(x).add_(coeffs[i])
     return z
 
-
 def bessel0_exp_scaled(x, eps=1e-8):
-    """
-    Approximates the exponentially-scaled modified bessel function of the first kind
-    I_0_bar(x) =  I_0(x) / exp(|x|) (https://arxiv.org/pdf/1710.03746.pdf Appendix C).
-    Exponential division (scaling) is for numerical stability since I_0(x) grows
-    very quickly with x.
-    https://omlc.org/software/mc/conv-src/convnr.c
-    :param x: Tensor of input values.
-    :return I_0_bar: Tensor of output values, same shape as x.
-    """
     abs_x = torch.abs(x).clamp(min=eps)
+
+    z1 = (abs_x / 3.75) ** 2
+    z2 = 3.75 / abs_x
+    sqrt_x = torch.sqrt(abs_x)
+
+    I_0_bar_a = horners_method(bessel0_exp_scaled_coeffs_a, z1) / torch.exp(abs_x)
+    I_0_bar_b = horners_method(bessel0_exp_scaled_coeffs_b, z2) / sqrt_x
+
     mask = abs_x <= 3.75
-    I_0_bar_a = horners_method(bessel0_exp_scaled_coeffs_a, (abs_x / 3.75) ** 2) / torch.exp(abs_x)
-    I_0_bar = horners_method(bessel0_exp_scaled_coeffs_b, 3.75 / abs_x) / torch.sqrt(abs_x)
-    I_0_bar[mask] = I_0_bar_a[mask]
+    I_0_bar = torch.where(mask, I_0_bar_a, I_0_bar_b)
+
     return I_0_bar
 
 
@@ -50,16 +38,6 @@ def torch_trapezoid_integral(func,
                              from_x,
                              to_x,
                              num_traps):
-    """
-    Integrates func from from_x to to_x using the trapezoid rule, with num_traps - 1 trapezoids.
-    :param func: Function to integrate (the integrand)
-    :param func_args: Arguments of f (but not the variable being integrated over)
-        In practice this is proper singular values s0, s1, s2 with shape (B, 3)
-    :param from_x lower limit of integration
-    :param to_x upper limit of integration
-    :param num_traps: number of trapezoids + 1
-    :return integral of func from from_x to to_x
-    """
     with torch.no_grad():
         range = torch.arange(num_traps, dtype=func_args.dtype, device=func_args.device)
         x = (range * ((to_x-from_x) / (num_traps - 1)) + from_x).view(1, num_traps)  # (x values: [from_x, to_x])
@@ -67,22 +45,10 @@ def torch_trapezoid_integral(func,
         weights[0, 0] = 1/2
         weights[0, -1] = 1/2
         y = func(x, func_args)
+
         return torch.sum(y * weights, dim=1) * (to_x - from_x)/(num_traps - 1)
 
-
 def integrand_normconst_forward_exp_scaled(u, s):
-    """
-    Integrand required to compute exp scaled normalising constant c_bar(S) = c(S) / exp(tr(S)).
-
-    Computed using modified Bessel functions of the first kind (I_0).
-
-    See Eqn 86 of https://arxiv.org/pdf/1710.03746.pdf for more details.
-
-    :param u: (1, N) Tensor of input values (will be integrated over).
-    :param s: (B, 3) Tensor of batch of proper singular values ordered from big to small.
-               Will be using s_i, s_j, s_k = s_2, s_3, s_1
-    :return integrand_c_bar: (B, N) Tensor of batch of integrand values over given x.
-    """
     # s is sorted from big to small
     factor1 = (s[:, [1]] - s[:, [2]]) * 0.5 * (1 - u)
     factor1 = bessel0_exp_scaled(factor1)
@@ -90,31 +56,15 @@ def integrand_normconst_forward_exp_scaled(u, s):
     factor2 = (s[:, [1]] + s[:, [2]]) * 0.5 * (1 + u)
     factor2 = bessel0_exp_scaled(factor2)
 
-    factor3 = torch.exp((s[:, [2]] + s[:, [0]]) * (u - 1))
+    factor3_input = (s[:, [2]] + s[:, [0]]) * (u - 1)
+
+    factor3 = torch.exp(factor3_input)
 
     integrand_c_bar = factor1 * factor2 * factor3
     return integrand_c_bar
 
 
 def integrand_dlognormconst_ds_backward(u, s):
-    """
-    Integrand required to compute derivative of log norm constant dlog(c(S)) / ds_k.
-
-    Since log(c(S)) = log(c_bar(S)) + tr(S),
-    dlog(c(S)) / ds_k = 1/c_bar(S) dc_bar(S) / ds_k + dtr(S) / ds_k
-    Since dtr(S) / ds_k = 1,
-    dlog(c(S)) / ds_k = 1/c_bar(S) dc_bar(S) / ds_k + 1
-                      = 1/c_bar(S) (dc_bar(S) / ds_k + c_bar(S))
-    The integrand computed here is for dc_bar(S) / ds_k + c_bar(S).
-
-    See Eqn. 85-90 of https://arxiv.org/pdf/1710.03746.pdf for more details.
-
-    :param u: (1, N) Tensor of input values (will be integrated over).
-    :param s: (B, 3) Tensor of batch of proper singular values.
-               Not necessarily ordered big to small (1, 2, 3), but in circular shifts
-               (1, 2, 3), (2, 3, 1), (3, 1, 2).
-    :return: integrand_dlogc_dcs_k: (B, N
-    """
     s_i = torch.max(s[:, 1:], dim=1, keepdim=True).values
     s_j = torch.min(s[:, 1:], dim=1, keepdim=True).values
     s_k = s[:, [0]]
@@ -132,28 +82,9 @@ def integrand_dlognormconst_ds_backward(u, s):
 
 
 class LogMFNormConstant(torch.autograd.Function):
-    """
-    Pytorch Autograd function with:
-        output: log normalising constant log(c(S)) = log(c_bar(S)) + tr(S)
-        input: proper singular values S = s0, s1, s2 (which will be predicted using NN).
 
-    Backward method gives gradient of output w.r.t. input ie:
-        dlog(c(S)) / ds_k for singular values s0, s1, s2.
-        dlog(c(S)) / ds_k = 1/c_bar(S) dc_bar(S) / ds_k + dtr(S) / ds_k
-        Since dtr(S) / ds_k = 1,
-        dlog(c(S))/ds_k = 1/c_bar(S) (dc_bar(S) / ds_k + c_bar(S))
-
-    See Eqn. 85-90 of https://arxiv.org/pdf/1710.03746.pdf for more details.
-    """
     @staticmethod
     def forward(ctx, S):
-        """
-        :param ctx: Pytorch context object, use for storing things required in the backward pass.
-        :param S: (B, 3) tensor, batch of proper singular values, ordered big to small.
-                      In practice, B = batch_size * num_smpl_joints
-        :return: log_c: (B,) tensor, batch of log norm constants corresponding to
-                        singular values in input.
-        """
         num_traps = 512  # Number of trapezoids + 1 for integral
 
         c_bar = 0.5 * torch_trapezoid_integral(func=integrand_normconst_forward_exp_scaled,
@@ -172,11 +103,6 @@ class LogMFNormConstant(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_log_c):
-        """
-        :param ctx: Pytorch context object, use for storing things required in the backward pass.
-        :param grad_log_c: (B,) tensor, gradient of loss w.r.t log c(S).
-        :return: grad_singvals: (B, 3) tensor, gradient of loss w.r.t S (i.e. singular values s0, s1, s2).
-        """
         S, c_bar = ctx.saved_tensors  # S is proper singular values, c_bar is exp scaled log norm constant.
         num_traps = 512  # Number of trapezoids + 1 for integral
 
@@ -193,6 +119,11 @@ class LogMFNormConstant(torch.autograd.Function):
         return grad_S.view(-1, 3)
 
 
+def debug_check_tensors(**tensors):
+    for name, t in tensors.items():
+        if not torch.isfinite(t).all():
+            print(f"Non-finite in {name}: nan={torch.isnan(t).any().item()}, inf={torch.isinf(t).any().item()}, min={t.min().item()}, max={t.max().item()}")
+
 
 
 def matrix_fisher_nll(pred_F,
@@ -200,6 +131,9 @@ def matrix_fisher_nll(pred_F,
                       S_diag,   # (N, 3) 対角成分
                       R_target,
                       overreg=1.025):
+
+    debug_check_tensors(S_diag=S_diag, pred_F=pred_F, R_mode=R_mode, R_target=R_target)
+
 
 
     # flatten batch and frames

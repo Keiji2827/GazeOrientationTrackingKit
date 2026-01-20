@@ -1,6 +1,3 @@
-
-
-
 import argparse
 from asyncio.log import logger
 import os
@@ -11,20 +8,20 @@ from torch.utils.data import random_split, DataLoader
 import torch
 #import cv2
 from models.smpl._smpl import SMPL, Mesh
-from models.bert.modeling_bert import BertConfig
-from models.bert.modeling_metro import METRO_Body_Network as METRO_Network
-from models.bert.modeling_metro import METRO
-from models.hrnet.hrnet_cls_net_featmaps import get_cls_net
-from models.hrnet.config import config as hrnet_config
-from models.hrnet.config import update_config as hrnet_update_config
-from models.dataloader.gafa_loader import create_gafa_dataset
+#from models.bert.modeling_bert import BertConfig
+#from models.bert.modeling_metro import METRO_Body_Network as METRO_Network
+#from models.bert.modeling_metro import METRO
+#from models.hrnet.hrnet_cls_net_featmaps import get_cls_net
+#from models.hrnet.config import config as hrnet_config
+#from models.hrnet.config import update_config as hrnet_update_config
+#from models.dataloader.gafa_loader import create_gafa_dataset
 from models.bert.modeling_gabert import GAZEFROMBODY
-from models.utils.geometric_layers import rotation_matrices_from_gaze,rotation_from_two_vectors
-from models.utils.matrix_operation_layer import svd_decompose_rotations, rotation_confidence_from_R
-from models.utils.matrix_fisher_loss import SO3GeodesicLoss, MatrixFisherKLLoss, GazeMFGaussianLoss, matrix_fisher_nll
+from models.utils.geometric_layers import rotation_from_two_vectors
+#from models.utils.matrix_operation_layer import svd_decompose_rotations, rotation_confidence_from_R
+from models.utils.matrix_fisher_loss import SO3GeodesicLoss, matrix_fisher_nll
 from models.utils.Angle_Error_loss import CosLoss, CosLossSingle
 from models.utils.metric_logger import AverageMeter
-from models.utils.miscellaneous import save_checkpoint, load_from_state_dict, create_dataset
+from models.utils.miscellaneous import save_checkpoint, load_from_state_dict, create_dataset, create_testdataset, create_valdataset
 
 
 def parse_args():
@@ -40,7 +37,7 @@ def parse_args():
                         help="Path to specific checkpoint for inference.")
     parser.add_argument("--output_dir", default='output/', type=str, required=False,
                         help="The output directory to save checkpoint and test results.")
-    parser.add_argument("--model_checkpoint", default='output/checkpoint-16-90588/state_dict.bin', 
+    parser.add_argument("--model_checkpoint", default='', 
                         type=str, required=False,
                         help="Path to wholebodygaze checkpoint for inference.")
     parser.add_argument("--model_metro_checkpoint", default='models/weights/metro/metro_for_gaze.pth', 
@@ -108,7 +105,7 @@ def main(args):
     _gaze_network = GAZEFROMBODY(args, _metro_network)
     _gaze_network.to(args.device)
 
-    if not args.num_init_epoch == 0:
+    if not args.model_checkpoint == '':
         state_dict = torch.load(args.model_checkpoint)
         _gaze_network.load_state_dict(state_dict)
         del state_dict
@@ -116,27 +113,36 @@ def main(args):
     if not args.test:
         print("Train mode")
         dset = create_dataset(args)
-        train_idx, val_idx = np.arange(0, int(len(dset)*0.9)), np.arange(int(len(dset)*0.9), len(dset))
+        train_idx, val_idx = np.arange(0, int(len(dset)*0.95)), np.arange(int(len(dset)*0.95), len(dset))
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=4, num_workers=4, pin_memory=True, shuffle=True
+            train_dset, batch_size=4, num_workers=2, pin_memory=False, shuffle=True
         )
-        val_dataloader = DataLoader(
-            val_dset, batch_size=24, shuffle=False, num_workers=16, pin_memory=True
+        #val_dataloader = DataLoader(
+        #    val_dset, batch_size=8, shuffle=False, num_workers=8, pin_memory=True
+        #)
+        dset = create_valdataset(args)
+        test_dataloader = DataLoader(
+            dset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True
         )
         # Training
-        train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler)
+        train(args, train_dataloader, test_dataloader, _gaze_network, smpl, mesh_sampler)
 
 
 
     else: 
-        print("Load wholebodygaze checkpoint from {}".format(args.model_checkpoint))
-        state_dict = torch.load(args.model_checkpoint)
-        _gaze_network.load_state_dict(state_dict)
-        del state_dict
+        print("Test mode")
+        print("Load checkpoint from {}".format(args.model_checkpoint))
+        dset = create_testdataset(args)
+        test_dataloader = DataLoader(
+            dset, batch_size=32, shuffle=True, num_workers=2, pin_memory=True
+        )
 
-        validate(args, val_dataloader, _gaze_network)
+        val = validate(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
+
+        print("val:", torch.rad2deg(torch.tensor(val)))
+
 
     return 0
 
@@ -152,8 +158,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     optimizer = torch.optim.AdamW(
         #params=list(_gaze_network.parameters()),lr=args.lr, 
         [
-        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
-        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 * 0.1},
+        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr},
+        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 * 0.1 * 0.1 * 0.1},
         {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
     ],
         betas=(0.9, 0.999), weight_decay=0
@@ -165,27 +171,26 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     criterion_seq = CosLoss().cuda(args.device)
     criterion_dir = CosLossSingle().cuda(args.device)
-    #criterion_Rot = matrix_fisher_nll().cuda(args.device)
+    criterion_mdir = CosLossSingle().cuda(args.device)
     criterion_Rot  = SO3GeodesicLoss().cuda(args.device)
 
     for epoch in range(args.num_init_epoch, epochs):
         log_losses = AverageMeter()
         log_seq = AverageMeter()
         log_dir = AverageMeter()
+        log_mdir = AverageMeter()
         log_Rot = AverageMeter()
         log_MF = AverageMeter()
         for iteration, batch in enumerate(train_dataloader):
-
 
             log_con = AverageMeter()
 
             iteration += 1
             _gaze_network.train()
 
-
             batch_imgs = batch['image'].cuda(args.device)
             gaze_dir = batch['gaze_dir'].cuda(args.device)
-            #head_dir = batch["head_dir"].cuda(args.device)
+            head_dir = batch["head_dir"].cuda(args.device)
             #head_mask = batch["head_mask"].cuda(args.device)
 
             batch_size = batch_imgs.size(0)
@@ -196,35 +201,38 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             data_time.update(time.time() - end)
 
             # forward-pass
-            directions, R_mode, S_diag, pred_F = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
+            directions, mdir, R_mode, S_diag, pred_F, d_corr = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
 
             confidence = S_diag.sum(dim=-1).detach()
             confidence = confidence / (confidence.max() + 1e-8)
-            #print(confidence.mean())
-            #confidence = 1.0 + confidence
+
+            # 数値安定化（STE）
+            S_safe = torch.clamp(S_diag, min=0.0, max=8.0)
+            S_diag = S_safe + (S_diag - S_diag.detach())
 
             # compute target rotation matrices from gaze directions
             R_target = rotation_from_two_vectors(gaze_dir)
 
-
             # loss
             loss_seq = criterion_seq(directions, gaze_dir).mean()
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
+            loss_mdir = criterion_mdir(mdir, head_dir[:, frame,:]).mean()
             loss_Rot = criterion_Rot(R_mode, R_target).mean()
             loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
-            #loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).detach().mean()
 
-            a = 0.4
-            b = 0.5
-            c = 0.2
-            d = 0.01
-            loss = ((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
+            a = 4.
+            b = 5.
+            m = 2.
+            c = 1.
+            d = 0.001
+            loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
             #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
             loss = loss.mean()
             # update logs
             log_losses.update(loss.item(), batch_size)
             log_seq.update(torch.rad2deg(loss_seq).item(), batch_size)
             log_dir.update(torch.rad2deg(loss_dir).item(), batch_size)
+            #log_mdir.update(torch.rad2deg(loss_mdir).item(), batch_size)
             log_Rot.update(torch.rad2deg(loss_Rot).item(), batch_size)
             log_MF.update(loss_MF.item(), batch_size)
             log_con.update(confidence.mean().item(), batch_size)
@@ -232,7 +240,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             # back prop
             optimizer.zero_grad()
             loss.backward() 
-            torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=0.5)
             optimizer.step()
 
             batch_time.update(time.time() - end)
@@ -250,8 +258,24 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     f" Rot: {log_Rot.avg:.3f}, MF: {log_MF.avg:.3f},"
                     f" con: {log_con.avg:.6f}")
 
-        checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
-        print("save trained model at ", checkpoint_dir)
+
+                with torch.no_grad():
+                    p99 = torch.quantile(d_corr.view(-1), 0.99).item()
+                    p01 = torch.quantile(d_corr.view(-1), 0.01).item()
+
+                print(f"p01 = {p01:.6f}, p99 = {p99:.6f}")
+
+
+            if iteration%(args.logging_steps*10) == 0:
+                val = validate(args, val_dataloader, 
+                                    _gaze_network, 
+                                    smpl, 
+                                    mesh_sampler
+                        )
+                print("val:", torch.rad2deg(torch.tensor(val)))
+
+                checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
+                print("save trained model at ", checkpoint_dir)
 
 
         val = validate(args, val_dataloader, 
@@ -259,7 +283,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                             smpl, 
                             mesh_sampler
                 )
-        print("val:", torch.rad2deg(val))
+        print("val:", torch.rad2deg(torch.tensor(val)))
 
 
     return 0
@@ -277,6 +301,7 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
     frame = args.n_frames // 2
     criterion = CosLossSingle().cuda(args.device)
 
+    print("len of dataset:", max_iter)
     with torch.no_grad():        
         for iteration, batch in enumerate(val_dataloader):
             iteration += 1
@@ -291,7 +316,7 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
 
             # forward-pass
             direction, S_diag = gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
-            #print(direction.shape)
+
             confidence = S_diag.sum(dim=-1).detach()
             confidence = confidence / (confidence.max() + 1e-8)
 
@@ -303,12 +328,14 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if iteration%args.logging_steps == 0 or iteration == max_iter:
+            if iteration%100 == 0 or iteration == max_iter:
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
                 print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration}, "
                       f"loss: {log_losses.avg:.4f}, con: {confidence.mean().item():.3f}")
+                
+                #return log_losses.avg
 
     return log_losses.avg
 

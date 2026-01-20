@@ -1,6 +1,7 @@
 import os
 import torch
 import random
+from torch.utils.data import Subset
 #import cv2
 from models.bert.modeling_bert import BertConfig
 from models.bert.modeling_metro import METRO_Body_Network as METRO_Network
@@ -107,6 +108,72 @@ def load_from_state_dict(args, smpl, mesh_sampler):
     return _metro_network
 
 
+def create_valdataset(args):
+    print(f"Creating dataset, is_GAFA: {args.is_GAFA}")
+    if not args.is_GAFA:
+        exp_names = [
+            'data20',
+            'data23',
+            'data25',
+            'data29_0',
+            'data29_1',
+            'data29_2',
+        ]
+        random.shuffle(exp_names)
+        # Ryukoku dataset
+        dset = create_gafa_dataset(exp_names=exp_names, root_dir='data/GoTK', n_frames=args.n_frames)
+
+    if args.is_GAFA:
+        exp_names = [
+            'library/1029_2', #
+            'lab/1013_2',
+            'kitchen/1022_2',
+            'living_room/006',
+            'courtyard/002',
+            'courtyard/003',  
+            ]
+        random.shuffle(exp_names)
+        # GAFA dataset
+        dset = create_gafa_dataset(exp_names=exp_names, n_frames=args.n_frames)
+
+    total = len(dset)
+    keep = max(1, total // 10)   # 1/10（最低1サンプルは確保）
+    indices = random.sample(range(total), keep)
+    dset = Subset(dset, indices)
+
+    return dset
+
+
+
+def create_testdataset(args):
+    print(f"Creating dataset, is_GAFA: {args.is_GAFA}")
+    if not args.is_GAFA:
+        exp_names = [
+            'data20',
+            'data23',
+            'data25',
+            'data29_0',
+            'data29_1',
+            'data29_2',
+        ]
+        random.shuffle(exp_names)
+        # Ryukoku dataset
+        dset = create_gafa_dataset(exp_names=exp_names, root_dir='data/GoTK', n_frames=args.n_frames)
+
+    if args.is_GAFA:
+        exp_names = [
+            'library/1029_2', #
+            'lab/1013_2',
+            'kitchen/1022_2',
+            'living_room/006',
+            'courtyard/002',
+            'courtyard/003',  
+            ]
+        random.shuffle(exp_names)
+        # GAFA dataset
+        dset = create_gafa_dataset(exp_names=exp_names, n_frames=args.n_frames)
+
+    return dset
 
 def create_dataset(args):
     print(f"Creating dataset, is_GAFA: {args.is_GAFA}")
@@ -124,6 +191,9 @@ def create_dataset(args):
         dset = create_gafa_dataset(exp_names=exp_names, root_dir='data/GoTK', n_frames=args.n_frames)
 
     if args.is_GAFA:
+        exp_names_s = [
+        'living_room/005',
+        ]
         exp_names = [
         'living_room/005',
         'living_room/004',
