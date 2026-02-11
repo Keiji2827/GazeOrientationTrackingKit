@@ -214,7 +214,7 @@ class HeadMFLayer(torch.nn.Module):
         device = images.device
 
 
-        debug_check_tensors(images=images)
+        #debug_check_tensors(images=images)
         #print("images dtype:", images.dtype)
         #print("images min/max:", images.min().item(), images.max().item())
 
@@ -223,7 +223,7 @@ class HeadMFLayer(torch.nn.Module):
         # ============================================================
         images_flat = images.reshape(B * T, C, H, W)
         feats_flat = self.encoder(images_flat)  # (B*T, C', H', W')
-        debug_check_tensors(feats_flat=feats_flat)
+        #debug_check_tensors(feats_flat=feats_flat)
         C2, H2, W2 = feats_flat.shape[1:]
         feats = feats_flat.reshape(B, T, C2, H2, W2)
 
@@ -237,28 +237,28 @@ class HeadMFLayer(torch.nn.Module):
         corr = (feat1_n * feat2_n).sum(dim=2, keepdim=True)  # in [-1, 1]
         #corr = (feat1 * feat2).sum(dim=2, keepdim=True)  # (B, T-1, 1, H2, W2)
         #corr = torch.clamp(corr, min=-20.0, max=20.0)
-        debug_check_tensors(corr=corr)
+        #debug_check_tensors(corr=corr)
         corr = corr.reshape(B, T-1, -1)                  # (B, T-1, H2*W2)
 
         # ============================================================
         # ✅ 3. MLP を一括処理（ループなし）
         # ============================================================
         corr_flat = corr.reshape(B * (T-1), -1)
-        debug_check_tensors(corr_flat=corr_flat)
+        #debug_check_tensors(corr_flat=corr_flat)
 
 
         q_mode = self.mlp_quat(corr_flat)  # (B*(T-1), 4)
-        debug_check_tensors(q_mode=q_mode)
+        #debug_check_tensors(q_mode=q_mode)
 
         q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8)
         R_mode = quaternion_to_rotation_matrix(q_mode)
-        debug_check_tensors(R_mode=R_mode)
+        #debug_check_tensors(R_mode=R_mode)
 
         R_mode = R_mode.reshape(B, T-1, 3, 3)
 
         # --- S ---------------------------------------------------
         S_diag = F.softplus(self.mlp_S(corr_flat))
-        debug_check_tensors(S_diag=S_diag)
+        #debug_check_tensors(S_diag=S_diag)
 
         s_max = 8.0                           # ← 推奨上限
         S_diag = torch.clamp(S_diag, max=s_max)
