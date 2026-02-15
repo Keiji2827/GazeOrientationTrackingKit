@@ -40,6 +40,11 @@ def draw_arrow(img, direction, head_bb, color, length=80):
     dx = int(direction[0] * length)
     dy = int(-direction[1] * length)
 
+    print("head_bb:", head_bb)
+    print(f"Draw arrow: ({cx}, {cy}) -> ({cx + dx}, {cy + dy})")
+
+
+
     cv2.arrowedLine(
         img,
         (cx, cy),
@@ -62,24 +67,26 @@ def main(args):
     with open(args.annotation_path, "rb") as f:
         anno = pickle.load(f)
 
-    img_indices = anno["index"]
-    head_bb_all = np.asarray(anno["head_bb"], dtype=np.float32)
-    gaze_gt_all = np.asarray(anno["gaze"], dtype=np.float32)
+    img_indices = np.asarray(anno["index"])
+    gaze_gt_all = np.asarray(anno["gazes"], dtype=np.float32)
+    head_bb_all = np.vstack(anno['head_bb']).astype(np.float32)
+    body_bb_all = np.vstack(anno['body_bb']).astype(np.float32)
 
     # --- find target index ---
     target_name = os.path.basename(args.target_image_path)
     target_idx = int(os.path.splitext(target_name)[0])
 
-    if target_idx not in img_indices:
-        raise ValueError("Target image not found in annotation")
+    matches = np.where(img_indices == target_idx)[0]
+    if len(matches) == 0:
+        raise ValueError(f"Target index {target_idx} not found in annotation")
 
-    i = img_indices.index(target_idx)
+    i = int(matches[0])
 
     if i - center < 0 or i + center >= len(img_indices):
         raise ValueError("Not enough frames around target image")
 
-    # --- load sequence ---
-    frame_ids = img_indices[i-center:i+center+1]
+    # --- load 7-frame sequence ---
+    frame_ids = img_indices[i - center : i + center + 1]
     img_paths = [
         os.path.join(args.image_dir, f"{idx:06}.jpg")
         for idx in frame_ids
@@ -95,7 +102,7 @@ def main(args):
     mesh_sampler = Mesh()
     smpl.eval()
 
-    metro = load_from_state_dict(None, smpl, mesh_sampler)
+    metro = load_from_state_dict(args, smpl, mesh_sampler)
     metro.to(device)
     metro.eval()
 
@@ -112,35 +119,49 @@ def main(args):
 
     # --- inference ---
     with torch.no_grad():
-        directions, _ = model(
+        directions, S_diag = model(
             imgs,
             smpl,
             mesh_sampler,
             is_train=False
         )
 
-    pred_gaze = directions[0, center].cpu().numpy()
+    pred_gaze = directions[0].cpu().numpy()
     gt_gaze = gaze_gt_all[i]
-    head_bb = head_bb_all[i]
+    #head_bb = head_bb_all[i]
+    #body_bb = body_bb_all[i]
 
     # --- visualization ---
     img_cv = cv2.imread(args.target_image_path)
     img_cv = cv2.resize(img_cv, (224, 224))
+
+    head_bb = head_bb_all[i].astype(np.float32).copy()
+    body_bb = body_bb_all[i].astype(np.float32)
+
+    # body-relative
+    head_bb[0] -= body_bb[0]
+    head_bb[1] -= body_bb[1]
+
+    head_bb[0] /= body_bb[2]
+    head_bb[2] /= body_bb[2]
+
+    head_bb[1] /= body_bb[3]
+    head_bb[3] /= body_bb[3]
 
     # GT: green
     draw_arrow(img_cv, gt_gaze, head_bb, (0, 255, 0))
     # Pred: red
     draw_arrow(img_cv, pred_gaze, head_bb, (0, 0, 255))
 
-    cv2.putText(
-        img_cv,
-        "GT (green) / Pred (red)",
-        (5, 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 255, 255),
-        1
-    )
+    #cv2.putText(
+    #    img_cv,
+    #    "GT (green) / Pred (red)",
+    #    (5, 18),
+    #    cv2.FONT_HERSHEY_SIMPLEX,
+    #    0.5,
+    #    (255, 255, 255),
+    #    1
+    #)
 
     cv2.imwrite(args.output_jpeg, img_cv)
     print(f"[OK] Saved: {args.output_jpeg}")
@@ -153,6 +174,30 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Overlay predicted and GT gaze on image"
     )
+
+    parser.add_argument("--num_hidden_layers", default=4, type=int, required=False, 
+                        help="Update model config if given")
+    parser.add_argument("--hidden_size", default=-1, type=int, required=False, 
+                        help="Update model config if given")
+    parser.add_argument("--num_attention_heads", default=4, type=int, required=False, 
+                        help="Update model config if given. Note that the division of "
+                        "hidden_size / num_attention_heads should be in integer.")
+    parser.add_argument("--intermediate_size", default=-1, type=int, required=False, 
+                        help="Update model config if given.")
+    parser.add_argument("--input_feat_dim", default='2051,512,128', type=str, 
+                        help="The Image Feature Dimension.")          
+    parser.add_argument("--hidden_feat_dim", default='1024,256,128', type=str, 
+                        help="The Image Feature Dimension.")
+    parser.add_argument("--model_name_or_path", default='models/bert/bert-base-uncased/', 
+                        type=str, required=False,
+                        help="Path to pre-trained transformer model or model type.")
+    parser.add_argument("--resume_checkpoint", default='models/weights/metro/metro_3dpw_state_dict.bin', 
+                        type=str, required=False,
+                        help="Path to specific checkpoint for inference.")
+    parser.add_argument("--model_metro_checkpoint", default='models/weights/metro/metro_for_gaze.pth', 
+                        type=str, required=False,
+                        help="Path to metro all checkpoint.")
+
     parser.add_argument("--target_image_path", required=True)
     parser.add_argument("--model_checkpoint", required=True)
     parser.add_argument("--output_jpeg", required=True)
