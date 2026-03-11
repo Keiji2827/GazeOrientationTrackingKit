@@ -3,6 +3,7 @@ Code adapted from https://github.com/Davmo049/Public_prob_orientation_estimation
 See Equations 85-90 in https://arxiv.org/pdf/1710.03746.pdf for more details.
 """
 
+import sys
 import torch
 import torch.nn as nn
 
@@ -123,7 +124,7 @@ def debug_check_tensors(**tensors):
     for name, t in tensors.items():
         if not torch.isfinite(t).all():
             print(f"Non-finite in {name}: nan={torch.isnan(t).any().item()}, inf={torch.isinf(t).any().item()}, min={t.min().item()}, max={t.max().item()}")
-
+            sys.exit(1)
 
 
 def matrix_fisher_nll(pred_F,

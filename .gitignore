@@ -41,6 +41,7 @@ models/weights
 output
 exps
 predictions
+output_images
 
 # hidden folder for aml configs
 .azureml

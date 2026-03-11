@@ -117,7 +117,7 @@ def main(args):
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=4, num_workers=2, pin_memory=False, shuffle=True
+            train_dset, batch_size=6, num_workers=2, pin_memory=False, shuffle=True
         )
         #val_dataloader = DataLoader(
         #    val_dset, batch_size=8, shuffle=False, num_workers=8, pin_memory=True
@@ -136,7 +136,7 @@ def main(args):
         print("Load checkpoint from {}".format(args.model_checkpoint))
         dset = create_testdataset(args)
         test_dataloader = DataLoader(
-            dset, batch_size=32, shuffle=True, num_workers=2, pin_memory=True
+            dset, batch_size=16, shuffle=True, num_workers=2, pin_memory=True
         )
 
         val = validate(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -222,9 +222,9 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             a = 4.
             b = 5.
-            m = 2.
+            m = 0.
             c = 1.
-            d = 0.001
+            d = 0.00001
             loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
             #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
             loss = loss.mean()
@@ -263,10 +263,10 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     p99 = torch.quantile(d_corr.view(-1), 0.99).item()
                     p01 = torch.quantile(d_corr.view(-1), 0.01).item()
 
-                print(f"p01 = {p01:.6f}, p99 = {p99:.6f}")
+                #print(f"p01 = {p01:.6f}, p99 = {p99:.6f}")
 
 
-            if iteration%(args.logging_steps*10) == 0:
+            if False: #iteration%(args.logging_steps*10) == 0:
                 val = validate(args, val_dataloader, 
                                     _gaze_network, 
                                     smpl, 
@@ -274,10 +274,12 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                         )
                 print("val:", torch.rad2deg(torch.tensor(val)))
 
-                checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
+                #checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
                 print("save trained model at ", checkpoint_dir)
 
 
+        checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
+        print("save trained model at ", checkpoint_dir)
         val = validate(args, val_dataloader, 
                             _gaze_network, 
                             smpl, 
@@ -296,10 +298,16 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
 
     #mse = AverageMeter()
     log_losses = AverageMeter()
+    log_losses_front = AverageMeter()
+    log_losses_back = AverageMeter()
 
     gaze_network.eval()
     frame = args.n_frames // 2
     criterion = CosLossSingle().cuda(args.device)
+
+    # カウント用
+    count_front = 0
+    count_back = 0
 
     print("len of dataset:", max_iter)
     with torch.no_grad():        
@@ -324,18 +332,45 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
 
             # update logs
             log_losses.update(loss.item(), batch_size)
+            # -------------------------
+            # 方向判定（frontal / back）
+            # -------------------------
+            z = gaze_dir[:, 2]  # [B]
+
+            mask_front = z > 0
+            mask_back = z <= 0
+
+            count_front += mask_front.sum().item()
+            count_back += mask_back.sum().item()
+
+            # frontal loss
+            if mask_front.any():
+                loss_front = criterion(direction[mask_front], gaze_dir[mask_front]).mean()
+                log_losses_front.update(loss_front.item(), mask_front.sum().item())
+
+            # back loss
+            if mask_back.any():
+                loss_back = criterion(direction[mask_back], gaze_dir[mask_back]).mean()
+                log_losses_back.update(loss_back.item(), mask_back.sum().item())
+
 
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if iteration%100 == 0 or iteration == max_iter:
+            if iteration%30000 == 0 or iteration == max_iter:
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
                 print(f"eta: {eta_string}, epoch: {epoch}, iter: {iteration}, "
-                      f"loss: {log_losses.avg:.4f}, con: {confidence.mean().item():.3f}")
-                
+                      f"loss: {log_losses.avg:.4f}," 
+                      f"loss_front: {log_losses_front.avg:.3f},"
+                      f"loss_back: {log_losses_back.avg:.3f},"
+                      f"con: {confidence.mean().item():.3f}")
+
                 #return log_losses.avg
+    print("val frontal:", torch.rad2deg(torch.tensor(log_losses_front.avg)))
+    print("val back:", torch.rad2deg(torch.tensor(log_losses_back.avg)))
+    print("count front:", count_front, " count back:", count_back)
 
     return log_losses.avg
 
