@@ -44,6 +44,7 @@ class GazeLSTM(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
         self.n_frames = args.n_frames
+        self.use_lstm = not args.no_use_lstm
         # ✅ batch_first=False に戻す（元コードと同じ）
         self.lstm = nn.LSTM(input_size=3, hidden_size=3, batch_first=False)
 
@@ -91,6 +92,17 @@ class GazeLSTM(torch.nn.Module):
 
         # (B, T, 3)
         dirs = torch.cat(dirs, dim=1)
+
+        if not self.use_lstm: # for ablation study: without LSTM, just use cumulative rotations
+            # arithmetic mean
+            mean_dir = dirs.mean(dim=1)  # (B, 3)
+            mean_dir = mean_dir / mean_dir.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+            # keep the output interface consistent with GazeLSTM
+            dirs_out = dirs.clone()
+            dirs_out[:, half, :] = mean_dir
+
+            return dirs_out
 
         # ============================
         # LSTM（元コードと同じ動作）

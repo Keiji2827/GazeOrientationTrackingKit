@@ -1,23 +1,14 @@
 import argparse
 from asyncio.log import logger
-import os
+import sys
 import random,datetime
 import time
 import numpy as np
 from torch.utils.data import random_split, DataLoader
 import torch
-#import cv2
 from models.smpl._smpl import SMPL, Mesh
-#from models.bert.modeling_bert import BertConfig
-#from models.bert.modeling_metro import METRO_Body_Network as METRO_Network
-#from models.bert.modeling_metro import METRO
-#from models.hrnet.hrnet_cls_net_featmaps import get_cls_net
-#from models.hrnet.config import config as hrnet_config
-#from models.hrnet.config import update_config as hrnet_update_config
-#from models.dataloader.gafa_loader import create_gafa_dataset
 from models.bert.modeling_gabert import GAZEFROMBODY
 from models.utils.geometric_layers import rotation_from_two_vectors
-#from models.utils.matrix_operation_layer import svd_decompose_rotations, rotation_confidence_from_R
 from models.utils.matrix_fisher_loss import SO3GeodesicLoss, matrix_fisher_nll
 from models.utils.Angle_Error_loss import CosLoss, CosLossSingle
 from models.utils.metric_logger import AverageMeter
@@ -68,6 +59,8 @@ def parse_args():
                         help="The initial lr.")
     parser.add_argument("--num_init_epoch", default=0, type=int, 
                         help="initial epoch number.")
+    parser.add_argument("--train_batch_size", default=4, type=int, 
+                        help="Batch size for training.")
     #########################################################
     # Others
     #########################################################
@@ -79,7 +72,8 @@ def parse_args():
     parser.add_argument("--test", action='store_true', default=False)
     parser.add_argument('--is_GAFA', action='store_true', default=False,
                         help="use GAFA dataset or not, default is False")
-
+    parser.add_argument('--no_use_lstm', action='store_true', default=False,
+                        help="ablation study: without LSTM, just use cumulative rotations")
 
     args = parser.parse_args()
     return args
@@ -88,6 +82,12 @@ def main(args):
 
     args.device = torch.device(args.device)
     print(f"Using device: {args.device}")
+    if args.no_use_lstm:
+        print("Ablation study: Using cumulative rotations without LSTM")
+
+    train_batch_size = args.train_batch_size
+
+    print("Command Lines: ", ' '.join(sys.argv))
 
     # Mesh and SMPL utils
     # from metro.modeling._smpl import SMPL, Mesh
@@ -117,7 +117,7 @@ def main(args):
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=4, num_workers=2, pin_memory=False, shuffle=True
+            train_dset, batch_size=train_batch_size, num_workers=2, pin_memory=False, shuffle=True
         )
         #val_dataloader = DataLoader(
         #    val_dset, batch_size=8, shuffle=False, num_workers=8, pin_memory=True
