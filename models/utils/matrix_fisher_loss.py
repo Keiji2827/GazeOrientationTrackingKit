@@ -13,41 +13,62 @@ bessel0_exp_scaled_coeffs_b = [0.39894228, 0.1328592e-1, 0.225319e-2, -0.157565e
 
 
 def horners_method(coeffs, x):
-    z = torch.empty(x.shape, dtype=x.dtype, device=x.device).fill_(coeffs[0])
+    z = torch.full_like(x, float(coeffs[0]))
     for i in range(1, len(coeffs)):
-        z.mul_(x).add_(coeffs[i])
+        z = z * x + coeffs[i]
     return z
 
-def bessel0_exp_scaled(x, eps=1e-8):
+def bessel0_exp_scaled(x, eps=1e-12):
+    """
+    exp(-|x|) * I0(|x|) の近似。
+    元コードと同じ近似式だが、torch.where で両枝を同時評価せず、
+    mask ごとに計算して不要枝の数値発散を避ける。
+    """
     abs_x = torch.abs(x).clamp(min=eps)
+    out = torch.empty_like(abs_x)
 
-    z1 = (abs_x / 3.75) ** 2
-    z2 = 3.75 / abs_x
-    sqrt_x = torch.sqrt(abs_x)
+    mask_small = abs_x <= 3.75
+    mask_large = ~mask_small
 
-    I_0_bar_a = horners_method(bessel0_exp_scaled_coeffs_a, z1) / torch.exp(abs_x)
-    I_0_bar_b = horners_method(bessel0_exp_scaled_coeffs_b, z2) / sqrt_x
+    if mask_small.any():
+        xs = abs_x[mask_small]
+        z1 = (xs / 3.75) ** 2
+        poly_a = horners_method(bessel0_exp_scaled_coeffs_a, z1)
+        out[mask_small] = poly_a / torch.exp(xs)
 
-    mask = abs_x <= 3.75
-    I_0_bar = torch.where(mask, I_0_bar_a, I_0_bar_b)
+    if mask_large.any():
+        xl = abs_x[mask_large]
+        z2 = 3.75 / xl
+        sqrt_x = torch.sqrt(xl)
+        poly_b = horners_method(bessel0_exp_scaled_coeffs_b, z2)
+        out[mask_large] = poly_b / sqrt_x
 
-    return I_0_bar
+    return out
 
 
-def torch_trapezoid_integral(func,
-                             func_args,
-                             from_x,
-                             to_x,
-                             num_traps):
+
+def torch_trapezoid_integral(func, func_args, from_x, to_x, num_traps):
+    """
+    積分は grad 不要なので no_grad のまま。
+    ただし内部計算は float64 に上げて数値安定性を改善する。
+    """
+    orig_dtype = func_args.dtype
+    calc_dtype = torch.float64 if orig_dtype in (torch.float16, torch.float32, torch.float64) else orig_dtype
+
     with torch.no_grad():
-        range = torch.arange(num_traps, dtype=func_args.dtype, device=func_args.device)
-        x = (range * ((to_x-from_x) / (num_traps - 1)) + from_x).view(1, num_traps)  # (x values: [from_x, to_x])
-        weights = torch.empty((1, num_traps), dtype=func_args.dtype, device=func_args.device).fill_(1)
-        weights[0, 0] = 1/2
-        weights[0, -1] = 1/2
-        y = func(x, func_args)
+        func_args_ = func_args.to(calc_dtype)
 
-        return torch.sum(y * weights, dim=1) * (to_x - from_x)/(num_traps - 1)
+        grid = torch.arange(num_traps, dtype=calc_dtype, device=func_args.device)
+        x = (grid * ((to_x - from_x) / (num_traps - 1)) + from_x).view(1, num_traps)
+
+        weights = torch.ones((1, num_traps), dtype=calc_dtype, device=func_args.device)
+        weights[0, 0] = 0.5
+        weights[0, -1] = 0.5
+
+        y = func(x, func_args_)
+
+        out = torch.sum(y * weights, dim=1) * ((to_x - from_x) / (num_traps - 1))
+        return out.to(orig_dtype)
 
 def integrand_normconst_forward_exp_scaled(u, s):
     # s is sorted from big to small
@@ -59,6 +80,8 @@ def integrand_normconst_forward_exp_scaled(u, s):
 
     factor3_input = (s[:, [2]] + s[:, [0]]) * (u - 1)
 
+    # 本来この項は多くの場合 0 以下だが、数値揺れで極端に大きい正値になった場合だけ抑制
+    factor3_input = torch.clamp(factor3_input, min=-80.0, max=80.0)
     factor3 = torch.exp(factor3_input)
 
     integrand_c_bar = factor1 * factor2 * factor3
@@ -76,9 +99,11 @@ def integrand_dlognormconst_ds_backward(u, s):
     factor2 = (s_i + s_j) * 0.5 * (1 + u)
     factor2 = bessel0_exp_scaled(factor2)
 
-    factor3 = torch.exp((s_j + s_k) * (u - 1))
+    factor3_input = (s_j + s_k) * (u - 1)
+    factor3_input = torch.clamp(factor3_input, min=-80.0, max=80.0)
+    factor3 = torch.exp(factor3_input)
 
-    integrand_dlogc_dcs_k = factor1 * factor2 * factor3 * u  # Don't have u-1 here because this is integrand of dc_bar(S)/ds_k + c_bar(S).
+    integrand_dlogc_dcs_k = factor1 * factor2 * factor3 * u
     return integrand_dlogc_dcs_k
 
 
@@ -86,88 +111,95 @@ class LogMFNormConstant(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, S):
-        num_traps = 512  # Number of trapezoids + 1 for integral
+        """
+        正規化定数計算は double で行い、返り値だけ元 dtype に戻す。
+        """
+        input_dtype = S.dtype
+        S64 = S.to(torch.float64)
 
-        c_bar = 0.5 * torch_trapezoid_integral(func=integrand_normconst_forward_exp_scaled,
-                                               func_args=S,
-                                               from_x=-1,
-                                               to_x=1,
-                                               num_traps=num_traps)  # c_bar(S), shape is (B,)
-        ctx.save_for_backward(S, c_bar)  # Save for gradient computation in backward pass
+        num_traps = 512
 
-        c_bar = c_bar.clamp(min=1e-12)  # Prevent log(0)
-        log_c_bar = torch.log(c_bar)  # log(c_bar(S))
-        log_trace_S = torch.sum(S, dim=1)  # tr(S)
+        c_bar64 = 0.5 * torch_trapezoid_integral(
+            func=integrand_normconst_forward_exp_scaled,
+            func_args=S64,
+            from_x=-1,
+            to_x=1,
+            num_traps=num_traps
+        ).to(torch.float64)
 
-        log_c = log_c_bar + log_trace_S  # log(c(S)) = log(c_bar(S)) + tr(S)
-        return log_c
+        # 積分誤差で負や 0 に触れるのを防ぐ
+        c_bar64 = c_bar64.clamp(min=1e-300)
+
+        ctx.save_for_backward(S64, c_bar64)
+        ctx.input_dtype = input_dtype
+
+        log_c_bar64 = torch.log(c_bar64)
+        log_trace_S64 = torch.sum(S64, dim=1)
+        log_c64 = log_c_bar64 + log_trace_S64
+
+        return log_c64.to(input_dtype)
 
     @staticmethod
     def backward(ctx, grad_log_c):
-        S, c_bar = ctx.saved_tensors  # S is proper singular values, c_bar is exp scaled log norm constant.
-        num_traps = 512  # Number of trapezoids + 1 for integral
+        S64, c_bar64 = ctx.saved_tensors
+        grad_log_c64 = grad_log_c.to(torch.float64)
 
-        dc_bar_dS = torch.empty((S.shape[0], 3), dtype=S.dtype, device=S.device)
+        num_traps = 512
+
+        dc_bar_dS64 = torch.empty((S64.shape[0], 3), dtype=torch.float64, device=S64.device)
         for i in range(3):
-            S_shifted = torch.cat((S[:, i:], S[:, :i]), dim=1)  # Cyclic shifts of singular values
-            dc_bar_dS[:, i] = 0.5 * torch_trapezoid_integral(func=integrand_dlognormconst_ds_backward,
-                                                             func_args=S_shifted,
-                                                             from_x=-1,
-                                                             to_x=1,
-                                                             num_traps=num_traps)  # dc_bar(S) / ds_k + c_bar(S)
-        dlogc_dS = dc_bar_dS / c_bar.view(-1, 1).clamp(min=1e-12)  # dlog(c(S)) / ds_k
-        grad_S = dlogc_dS * grad_log_c.view(-1, 1)
-        return grad_S.view(-1, 3)
+            S_shifted64 = torch.cat((S64[:, i:], S64[:, :i]), dim=1)
+            dc_bar_dS64[:, i] = 0.5 * torch_trapezoid_integral(
+                func=integrand_dlognormconst_ds_backward,
+                func_args=S_shifted64,
+                from_x=-1,
+                to_x=1,
+                num_traps=num_traps
+            ).to(torch.float64)
 
+        denom = c_bar64.view(-1, 1).clamp(min=1e-300)
+        dlogc_dS64 = dc_bar_dS64 / denom
+        grad_S64 = dlogc_dS64 * grad_log_c64.view(-1, 1)
 
-def debug_check_tensors(**tensors):
-    for name, t in tensors.items():
-        if not torch.isfinite(t).all():
-            print(f"Non-finite in {name}: nan={torch.isnan(t).any().item()}, inf={torch.isinf(t).any().item()}, min={t.min().item()}, max={t.max().item()}")
-            sys.exit(1)
-
-
-def matrix_fisher_nll(pred_F,
-                      R_mode,   # 単一の直交行列 (U V^T)
-                      S_diag,   # (N, 3) 対角成分
-                      R_target,
-                      overreg=1.025):
-
-    debug_check_tensors(S_diag=S_diag, pred_F=pred_F, R_mode=R_mode, R_target=R_target)
+        return grad_S64.to(ctx.input_dtype)
 
 
 
+
+def matrix_fisher_nll(
+    pred_F,
+    R_mode,   # 単一の直交行列 (U V^T)
+    S_diag,   # (..., 3)
+    R_target,
+    overreg=1.025
+):
     # flatten batch and frames
     N = R_mode.shape[0] * R_mode.shape[1]
-    pred_F = pred_F.view(N, 3, 3)
-    R_mode = R_mode.view(N, 3, 3)
-    S_diag = S_diag.view(N, 3)
-    R_target = R_target.view(N, 3, 3)
+    pred_F = pred_F.reshape(N, 3, 3)
+    R_mode = R_mode.reshape(N, 3, 3)
+    S_diag = S_diag.reshape(N, 3)
+    R_target = R_target.reshape(N, 3, 3)
 
     # Proper singular values を計算
+    # det(UV^T) は理論上 ±1 なので、符号だけを使って安定化
     with torch.no_grad():
-        s3sign = torch.det(R_mode.detach().cpu()).to(S_diag.device)  # det(UV^T) = ±1
+        det_R = torch.linalg.det(R_mode.detach().to(torch.float64)).to(S_diag.device)
+        s3sign = torch.where(det_R >= 0, torch.ones_like(det_R), -torch.ones_like(det_R)).to(S_diag.dtype)
+
     pred_S_proper = S_diag.clone()
-    pred_S_proper[..., 2] *= s3sign
+    pred_S_proper[..., 2] = pred_S_proper[..., 2] * s3sign
 
     # 正規化定数
     log_norm_constant = LogMFNormConstant.apply(pred_S_proper)
 
     # 尤度項
-    log_exponent = -torch.matmul(pred_F.view(-1, 1, 9), R_target.view(-1, 9, 1)).view(-1)
+    log_exponent = -torch.matmul(
+        pred_F.reshape(-1, 1, 9),
+        R_target.reshape(-1, 9, 1)
+    ).reshape(-1)
 
-    #return log_exponent + overreg * log_norm_constant
     loss = log_exponent + overreg * log_norm_constant
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-    if torch.isnan(loss).any():
-        print("Warning: NaN detected in loss and replaced with 0.")
-
-    loss = torch.where(torch.isinf(loss), torch.zeros_like(loss), loss)
-    if torch.isinf(loss).any():
-        print("Warning: Inf detected in loss and replaced with 0.")
-
     return loss
-
 
 
 class SO3GeodesicLoss(nn.Module):

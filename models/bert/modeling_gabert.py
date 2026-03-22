@@ -30,7 +30,7 @@ class GAZEFROMBODY(torch.nn.Module):
         if is_train == True:
             return dirs, mdir, R_mode, S_diag, F_mat, d_corr
         if is_train == False:
-            return dirs[:,self.n_frames//2,:], S_diag#, pred_vertices, pred_camera
+            return dirs[:,self.n_frames//2,:], S_diag
 
 
 def cumulative_matmul(R):
@@ -125,14 +125,7 @@ class GazeLSTM(torch.nn.Module):
         # ✅ 中心フレームだけ置き換える（元コードと同じ）
         dirs_out = dirs.clone()
 
-        # ✅ in-place を避ける
-        center = lstm_out[:, half, :].unsqueeze(1)  # (B,1,3)
-
-        dirs_out = torch.cat([
-            dirs_out[:, :half, :],
-            center,
-            dirs_out[:, half+1:, :]
-        ], dim=1)
+        dirs_out[:, half, :] = lstm_out[:, half, :]
 
         return dirs_out
 
@@ -262,7 +255,7 @@ class HeadMFLayer(torch.nn.Module):
         q_mode = self.mlp_quat(corr_flat)  # (B*(T-1), 4)
         #debug_check_tensors(q_mode=q_mode)
 
-        q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        #q_mode = q_mode / q_mode.norm(dim=1, keepdim=True).clamp(min=1e-8) # 2重に正規化しないように修正
         R_mode = quaternion_to_rotation_matrix(q_mode)
         #debug_check_tensors(R_mode=R_mode)
 
@@ -283,7 +276,8 @@ class HeadMFLayer(torch.nn.Module):
         # ============================================================
         # ✅ 4. F_mat も一括処理
         # ============================================================
-        F_mat = R_mode @ torch.diag_embed(S_diag)
+        #F_mat = R_mode @ torch.diag_embed(S_diag)
+        F_mat = R_mode * S_diag.unsqueeze(-2)  # modified for computational efficiency
 
         return R_mode, S_diag, F_mat, corr
 
@@ -301,6 +295,9 @@ class BertLayer(torch.nn.Module):
         self.flatten2  = torch.nn.Flatten()
 
         self.metromodule = copy.deepcopy(bert)
+        self.metromodule.eval()
+        for p in self.metromodule.parameters():
+            p.requires_grad_(False)
         self.body_mlp1 = torch.nn.Linear(14*3,32)
         self.body_tanh1 = torch.nn.PReLU()
         self.body_mlp2 = torch.nn.Linear(32,32)
@@ -325,11 +322,10 @@ class BertLayer(torch.nn.Module):
 
 
     def forward(self, images, smpl, mesh_sampler, is_train=False):
-        batch_size = images.size(0)
-        #self.bert.train()
-        self.metromodule.eval()
+        #batch_size = images.size(0)
+        #self.metromodule.eval()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             _, tmp_joints, _, _, _, _, _, _ = self.metromodule(images, smpl, mesh_sampler)
 
         #pred_joints = torch.stack(pred_joints, dim=3)

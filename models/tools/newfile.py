@@ -163,7 +163,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
         #params=list(_gaze_network.parameters()),lr=args.lr, 
         [
         {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr},
-        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr * 0.1 * 0.1 * 0.1 * 0.1},
+        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr},
         {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
     ],
         betas=(0.9, 0.999), weight_decay=0
@@ -233,7 +233,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             b = 5.
             m = 2.
             c = 1.
-            d = 0.00001
+            d = 0.001
             loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
             #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
             loss = loss.mean()
