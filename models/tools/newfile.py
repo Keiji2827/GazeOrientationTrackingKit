@@ -117,7 +117,7 @@ def main(args):
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=6, num_workers=2, pin_memory=False, shuffle=True
+            train_dset, batch_size=4, num_workers=2, pin_memory=False, shuffle=True
         )
         #val_dataloader = DataLoader(
         #    val_dset, batch_size=8, shuffle=False, num_workers=8, pin_memory=True
@@ -136,7 +136,7 @@ def main(args):
         print("Load checkpoint from {}".format(args.model_checkpoint))
         dset = create_testdataset(args)
         test_dataloader = DataLoader(
-            dset, batch_size=16, shuffle=True, num_workers=2, pin_memory=True
+            dset, batch_size=24, shuffle=True, num_workers=2, pin_memory=True
         )
 
         val = validate(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -222,7 +222,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             a = 4.
             b = 5.
-            m = 0.
+            m = 2.
             c = 1.
             d = 0.00001
             loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
@@ -270,7 +270,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 val = validate(args, val_dataloader, 
                                     _gaze_network, 
                                     smpl, 
-                                    mesh_sampler
+                                    mesh_sampler,
+                                    in_train=True
                         )
                 print("val:", torch.rad2deg(torch.tensor(val)))
 
@@ -283,7 +284,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
         val = validate(args, val_dataloader, 
                             _gaze_network, 
                             smpl, 
-                            mesh_sampler
+                            mesh_sampler,
+                            in_train=True
                 )
         print("val:", torch.rad2deg(torch.tensor(val)))
 
@@ -291,7 +293,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     return 0
 
 
-def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
+def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=False):
     max_iter = len(val_dataloader)
     end = time.time()
     batch_time = AverageMeter()
@@ -357,7 +359,7 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if iteration%30000 == 0 or iteration == max_iter:
+            if iteration%args.logging_steps == 0 or iteration == max_iter:
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
@@ -367,6 +369,8 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler):
                       f"loss_back: {log_losses_back.avg:.3f},"
                       f"con: {confidence.mean().item():.3f}")
 
+            if in_train:
+                return log_losses.avg
                 #return log_losses.avg
     print("val frontal:", torch.rad2deg(torch.tensor(log_losses_front.avg)))
     print("val back:", torch.rad2deg(torch.tensor(log_losses_back.avg)))

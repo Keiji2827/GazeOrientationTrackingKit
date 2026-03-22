@@ -197,7 +197,7 @@ def main(args):
 
     test_dataloader = DataLoader(
         #dset, batch_size=1, shuffle=True, num_workers=1, pin_memory=True
-        dset, batch_size=72, shuffle=True, num_workers=1, pin_memory=True
+        dset, batch_size=32, shuffle=True, num_workers=1, pin_memory=True
     )
 
     run_test(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
