@@ -74,6 +74,8 @@ def parse_args():
                         help="use GAFA dataset or not, default is False")
     parser.add_argument('--no_use_lstm', action='store_true', default=False,
                         help="ablation study: without LSTM, just use cumulative rotations")
+    parser.add_argument('--no_use_MF', action='store_true', default=False,
+                        help="ablation study: without matrix fisher loss")
 
     args = parser.parse_args()
     return args
@@ -84,6 +86,8 @@ def main(args):
     print(f"Using device: {args.device}")
     if args.no_use_lstm:
         print("Ablation study: Using cumulative rotations without LSTM")
+    if args.no_use_MF:
+        print("Ablation study: Not using matrix fisher loss")
 
     train_batch_size = args.train_batch_size
 
@@ -203,12 +207,13 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             # forward-pass
             directions, mdir, R_mode, S_diag, pred_F, d_corr = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
 
-            confidence = S_diag.sum(dim=-1).detach()
-            confidence = confidence / (confidence.max() + 1e-8)
+            if not args.no_use_MF:
+                confidence = S_diag.sum(dim=-1).detach()
+                confidence = confidence / (confidence.max() + 1e-8)
 
-            # 数値安定化（STE）
-            S_safe = torch.clamp(S_diag, min=0.0, max=8.0)
-            S_diag = S_safe + (S_diag - S_diag.detach())
+                # 数値安定化（STE）
+                S_safe = torch.clamp(S_diag, min=0.0, max=8.0)
+                S_diag = S_safe + (S_diag - S_diag.detach())
 
             # compute target rotation matrices from gaze directions
             R_target = rotation_from_two_vectors(gaze_dir)
@@ -218,7 +223,11 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
             loss_mdir = criterion_mdir(mdir, head_dir[:, frame,:]).mean()
             loss_Rot = criterion_Rot(R_mode, R_target).mean()
-            loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
+            if not args.no_use_MF:
+                loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
+            else:
+                loss_MF = torch.tensor(0.0).cuda(args.device)
+                confidence = torch.tensor(0.0).cuda(args.device)
 
             a = 4.
             b = 5.

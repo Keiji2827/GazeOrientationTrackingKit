@@ -9,6 +9,7 @@ class GAZEFROMBODY(torch.nn.Module):
 
     def __init__(self, args, bert):
         self.n_frames = args.n_frames
+        self.no_use_MF = args.no_use_MF
         super(GAZEFROMBODY, self).__init__()
         self.BertLayer = BertLayer(args, bert)
         self.HeadMFLayer = HeadMFLayer(args)
@@ -17,9 +18,14 @@ class GAZEFROMBODY(torch.nn.Module):
     def forward(self, images, smpl, mesh_sampler, is_train=False):
 
         dir, mdir = self.BertLayer(images[:,self.n_frames//2], smpl, mesh_sampler, is_train=True)
+        if self.no_use_MF:
+            R_mode, d_corr = self.HeadMFLayer(images, is_train=True)
+            S_diag = None
+            F_mat = None
+        else:
+            R_mode, S_diag, F_mat, d_corr = self.HeadMFLayer(images, is_train=True)
 
-        R_mode, S_diag, F_mat, d_corr = self.HeadMFLayer(images, is_train=True)
-        dirs = self.LSTMlayer(dir, R_mode, S_diag, is_train=True)
+        dirs = self.LSTMlayer(dir, R_mode, is_train=True)
 
         if is_train == True:
             return dirs, mdir, R_mode, S_diag, F_mat, d_corr
@@ -44,11 +50,11 @@ class GazeLSTM(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
         self.n_frames = args.n_frames
-        self.use_lstm = not args.no_use_lstm
+        self.no_use_lstm = args.no_use_lstm
         # ✅ batch_first=False に戻す（元コードと同じ）
         self.lstm = nn.LSTM(input_size=3, hidden_size=3, batch_first=False)
 
-    def forward(self, dir, R_mode, S_diag, is_train=False):
+    def forward(self, dir, R_mode, is_train=False):
         """
         dir: (batch, 3)
         R_mode: (batch, n_frames-1, 3, 3)
@@ -93,7 +99,7 @@ class GazeLSTM(torch.nn.Module):
         # (B, T, 3)
         dirs = torch.cat(dirs, dim=1)
 
-        if not self.use_lstm: # for ablation study: without LSTM, just use cumulative rotations
+        if self.no_use_lstm: # for ablation study: without LSTM, just use cumulative rotations
             # arithmetic mean
             mean_dir = dirs.mean(dim=1)  # (B, 3)
             mean_dir = mean_dir / mean_dir.norm(dim=1, keepdim=True).clamp(min=1e-8)
@@ -213,6 +219,7 @@ class HeadMFLayer(torch.nn.Module):
     def __init__(self, args):
         super(HeadMFLayer, self).__init__()
         self.n_frames = args.n_frames
+        self.no_use_MF = args.no_use_MF
         self.encoder = EfficientNetShallow()
         self.h = 28
         self.w = 28
@@ -220,15 +227,8 @@ class HeadMFLayer(torch.nn.Module):
         self.mlp_quat = RotationMLP(in_dim=self.h * self.w, out_dim=4)  # R_mode 用
         self.mlp_S = RotationMLP(in_dim=self.h * self.w, out_dim=3)     # 精度パラメータ S 用
 
-
     def forward(self, images, is_train=False):
         B, T, C, H, W = images.shape
-        device = images.device
-
-
-        #debug_check_tensors(images=images)
-        #print("images dtype:", images.dtype)
-        #print("images min/max:", images.min().item(), images.max().item())
 
         # ============================================================
         # ✅ 1. EfficientNetShallow をフレームごとに1回だけ実行
@@ -268,7 +268,11 @@ class HeadMFLayer(torch.nn.Module):
 
         R_mode = R_mode.reshape(B, T-1, 3, 3)
 
-        # --- S ---------------------------------------------------
+        if self.no_use_MF:
+            # ablation study: not using matrix fisher loss, just return identity and dummy S
+            return R_mode, corr
+
+        # --- For matirx fisher distribution ------------------------
         S_diag = F.softplus(self.mlp_S(corr_flat))
         #debug_check_tensors(S_diag=S_diag)
 
