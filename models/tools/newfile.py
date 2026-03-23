@@ -378,9 +378,9 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
                       f"loss_back: {log_losses_back.avg:.3f},"
                       f"con: {confidence.mean().item():.3f}")
 
-            if in_train:
-                return log_losses.avg
-                #return log_losses.avg
+                if in_train:
+                    return log_losses.avg
+                    #return log_losses.avg
     print("val frontal:", torch.rad2deg(torch.tensor(log_losses_front.avg)))
     print("val back:", torch.rad2deg(torch.tensor(log_losses_back.avg)))
     print("count front:", count_front, " count back:", count_back)
