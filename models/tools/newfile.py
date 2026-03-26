@@ -121,14 +121,14 @@ def main(args):
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
-            train_dset, batch_size=train_batch_size, num_workers=2, pin_memory=False, shuffle=True
+            train_dset, batch_size=train_batch_size, num_workers=2, pin_memory=True, persistent_workers=True, shuffle=True
         )
         #val_dataloader = DataLoader(
         #    val_dset, batch_size=8, shuffle=False, num_workers=8, pin_memory=True
         #)
         dset = create_valdataset(args)
         test_dataloader = DataLoader(
-            dset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True
+            dset, batch_size=4, shuffle=True, num_workers=2, persistent_workers=True, pin_memory=True
         )
         # Training
         train(args, train_dataloader, test_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -140,7 +140,7 @@ def main(args):
         print("Load checkpoint from {}".format(args.model_checkpoint))
         dset = create_testdataset(args)
         test_dataloader = DataLoader(
-            dset, batch_size=24, shuffle=True, num_workers=2, pin_memory=True
+            dset, batch_size=24, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True
         )
 
         val = validate(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -151,7 +151,6 @@ def main(args):
     return 0
 
 
-
 def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler):
     max_iter = len(train_dataloader)
     print("len of dataset:",max_iter)
@@ -159,10 +158,16 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     frame = args.n_frames // 2
     epochs = args.num_train_epochs
+
+    # 4つのモジュールでパラメータを分けて、BertLayerのbackboneは学習率を0.2倍にする
+    backbone_params = list(_gaze_network.BertLayer.bert.backbone.parameters())
+    backbone_param_ids = {id(p) for p in backbone_params}
+    bertlayer_other_params = [p for p in _gaze_network.BertLayer.parameters() if id(p) not in backbone_param_ids]
+
     optimizer = torch.optim.AdamW(
-        #params=list(_gaze_network.parameters()),lr=args.lr, 
         [
-        {"params": _gaze_network.BertLayer.parameters(), "lr": args.lr},
+        {"params": backbone_params, "lr": args.lr * 0.02},
+        {"params": bertlayer_other_params, "lr": args.lr},
         {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr},
         {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
     ],
@@ -178,8 +183,6 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     criterion_mdir = CosLossSingle().cuda(args.device)
     criterion_Rot  = SO3GeodesicLoss().cuda(args.device)
 
-    nan_debug_done = False
-
     for epoch in range(args.num_init_epoch, epochs):
         log_losses = AverageMeter()
         log_seq = AverageMeter()
@@ -194,9 +197,9 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             iteration += 1
             _gaze_network.train()
 
-            batch_imgs = batch['image'].cuda(args.device)
-            gaze_dir = batch['gaze_dir'].cuda(args.device)
-            head_dir = batch["head_dir"].cuda(args.device)
+            batch_imgs = batch['image'].cuda(args.device, non_blocking=True)
+            gaze_dir = batch['gaze_dir'].cuda(args.device, non_blocking=True)
+            head_dir = batch["head_dir"].cuda(args.device, non_blocking=True)
             #head_mask = batch["head_mask"].cuda(args.device)
 
             batch_size = batch_imgs.size(0)
@@ -208,49 +211,6 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             # forward-pass
             directions, mdir, R_mode, S_diag, pred_F, d_corr = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
-
-            def _check_tensor_simple(name, x):
-                if not torch.isfinite(x).all():
-                    return False
-                return True
-
-            def _check_tensor(name, x):
-                if not torch.isfinite(x).all():
-                    print(f"[DEBUG][{name}] has NaN/Inf")
-                    print(f"  shape = {tuple(x.shape)}")
-                    print(f"  nan count = {torch.isnan(x).sum().item()}")
-                    print(f"  inf count = {torch.isinf(x).sum().item()}")
-                    return False
-                else:
-                    with torch.no_grad():
-                        print(
-                            f"[DEBUG][{name}] "
-                            f"min={x.min().item():.6e}, "
-                            f"max={x.max().item():.6e}, "
-                            f"mean={x.mean().item():.6e}"
-                        )
-                    return True
-
-            ok1 = _check_tensor_simple("directions", directions)
-            ok2 = _check_tensor_simple("mdir", mdir)
-            ok3 = _check_tensor_simple("R_mode", R_mode)
-            ok4 = _check_tensor_simple("S_diag(before clamp)", S_diag)
-            ok5 = _check_tensor_simple("pred_F", pred_F)
-            ok6 = _check_tensor_simple("d_corr", d_corr)
-
-            if not (ok1 and ok2 and ok3 and ok4 and ok5 and ok6):
-                if not nan_debug_done:
-                    print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: network output already broken.")
-                    _check_tensor("directions", directions)
-                    _check_tensor("mdir", mdir)
-                    _check_tensor("R_mode", R_mode)
-                    _check_tensor("S_diag(before clamp)", S_diag)
-                    _check_tensor("pred_F", pred_F)
-                    _check_tensor("d_corr", d_corr)
-                    nan_debug_done = True
-
-                optimizer.zero_grad(set_to_none=True)
-                continue
 
             if not args.no_use_MF:
                 confidence = S_diag.sum(dim=-1).detach()
@@ -268,41 +228,12 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
             loss_mdir = criterion_mdir(mdir, head_dir[:, frame,:]).mean()
             loss_Rot = criterion_Rot(R_mode, R_target).mean()
-
-            # MF loss
             if not args.no_use_MF:
-                try:
-                    raw_loss_MF = matrix_fisher_nll(
-                        pred_F, R_mode, S_diag, R_target
-                    ).mean()
-                except Exception as e:
-                    if not nan_debug_done:
-                        print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: matrix_fisher_nll failed: {e}")
-                        _check_tensor("pred_F", pred_F)
-                        _check_tensor("R_mode", R_mode)
-                        _check_tensor("S_diag", S_diag)
-                        _check_tensor("R_target", R_target)
-                        nan_debug_done = True
-                    raw_loss_MF = torch.tensor(float("nan"), device=batch_imgs.device, dtype=loss_seq.dtype)
-
-                if torch.isfinite(raw_loss_MF):
-                    loss_MF = torch.clamp(raw_loss_MF, min=-100.0, max=100.0)
-                    mf_valid = True
-                else:
-                    if not nan_debug_done:
-                        print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: raw_loss_MF is NaN/Inf.")
-                        _check_tensor("pred_F", pred_F)
-                        _check_tensor("R_mode", R_mode)
-                        _check_tensor("S_diag", S_diag)
-                        _check_tensor("R_target", R_target)
-                        nan_debug_done = True
-
-                    loss_MF = torch.zeros((), device=batch_imgs.device, dtype=loss_seq.dtype)
-                    mf_valid = False
+                loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
+                loss_MF = torch.clamp(loss_MF, -50.0, 50.0)
             else:
-                loss_MF = torch.zeros((), device=batch_imgs.device, dtype=loss_seq.dtype)
-                mf_valid = False
-                confidence = torch.tensor(0.0, device=batch_imgs.device)
+                loss_MF = torch.tensor(0.0).cuda(args.device)
+                confidence = torch.tensor(0.0).cuda(args.device)
 
             a = 4.
             b = 5.
@@ -324,35 +255,11 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             else:
                 mf_weight = d
 
-            # nan/inf が出た step では MF を無効化
-            if not mf_valid:
-                mf_weight = 0.0
 
-            loss = (
-                a * loss_seq
-                + b * loss_dir
-                + m * loss_mdir
-                + c * loss_Rot
-                + mf_weight * loss_MF
-            )
+            loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
+            #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
             loss = loss.mean()
-
-            # ===== 追加4: 最終 loss の nan/inf 対策 =====
-            if not torch.isfinite(loss):
-                if not nan_debug_done:
-                    print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: total loss is NaN/Inf.")
-                    print(f"[DEBUG] loss_seq={loss_seq.item() if torch.isfinite(loss_seq) else loss_seq}")
-                    print(f"[DEBUG] loss_dir={loss_dir.item() if torch.isfinite(loss_dir) else loss_dir}")
-                    print(f"[DEBUG] loss_mdir={loss_mdir.item() if torch.isfinite(loss_mdir) else loss_mdir}")
-                    print(f"[DEBUG] loss_Rot={loss_Rot.item() if torch.isfinite(loss_Rot) else loss_Rot}")
-                    print(f"[DEBUG] loss_MF={loss_MF.item() if torch.isfinite(loss_MF) else loss_MF}")
-                    print(f"[DEBUG] mf_weight={mf_weight}")
-                    nan_debug_done = True
-
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
-            # logs
+            # update logs
             log_losses.update(loss.item(), batch_size)
             log_seq.update(torch.rad2deg(loss_seq).item(), batch_size)
             log_dir.update(torch.rad2deg(loss_dir).item(), batch_size)
@@ -362,36 +269,12 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             log_con.update(confidence.mean().item(), batch_size)
 
             # back prop
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward() 
-
-            bad_grad = False
-            for name, p in _gaze_network.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    if not nan_debug_done:
-                        print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: grad of {name} has NaN/Inf")
-                        nan_debug_done = True
-                    bad_grad = True
-                    break
-
-            if bad_grad:
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
+            if _gaze_network.BertLayer.bert.backbone.conv1.weight.grad is not None:
+                _gaze_network.BertLayer.bert.backbone.conv1.weight.grad.data.clamp_(-1.0, 1.0)
             torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=0.5)
             optimizer.step()
-
-            bad_param = False
-            for name, p in _gaze_network.named_parameters():
-                if not torch.isfinite(p.data).all():
-                    if not nan_debug_done:
-                        print(f"[NaN DETECTED] epoch={epoch} iter={iteration}: parameter {name} became NaN/Inf after optimizer.step()")
-                        nan_debug_done = True
-                    bad_param = True
-                    break
-
-            if bad_param:
-                break
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -407,14 +290,6 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     f" loss: {log_losses.avg:.4f}, angle: {(log_dir.avg+log_seq.avg)/2:.3f},"
                     f" Rot: {log_Rot.avg:.3f}, MF: {log_MF.avg:.3f},"
                     f" con: {log_con.avg:.6f}")
-
-
-                with torch.no_grad():
-                    p99 = torch.quantile(d_corr.view(-1), 0.99).item()
-                    p01 = torch.quantile(d_corr.view(-1), 0.01).item()
-
-                #print(f"p01 = {p01:.6f}, p99 = {p99:.6f}")
-
 
             if False: #iteration%(args.logging_steps*10) == 0:
                 val = validate(args, val_dataloader, 
