@@ -1,7 +1,6 @@
 import argparse
-from asyncio.log import logger
 import sys
-import random,datetime
+import datetime
 import time
 import numpy as np
 from torch.utils.data import random_split, DataLoader
@@ -53,7 +52,7 @@ def parse_args():
     #########################################################
     # Training parameters
     #########################################################
-    parser.add_argument("--num_train_epochs", default=10, type=int, 
+    parser.add_argument("--num_train_epochs", default=8, type=int, 
                         help="Total number of training epochs to perform.")
     parser.add_argument('--lr', "--learning_rate", default=1e-5, type=float, 
                         help="The initial lr.")
@@ -159,7 +158,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     frame = args.n_frames // 2
     epochs = args.num_train_epochs
 
-    # 4つのモジュールでパラメータを分けて、BertLayerのbackboneは学習率を0.2倍にする
+    # optimizer settings
     backbone_params = list(_gaze_network.BertLayer.bert.backbone.parameters())
     backbone_param_ids = {id(p) for p in backbone_params}
     bertlayer_other_params = [p for p in _gaze_network.BertLayer.parameters() if id(p) not in backbone_param_ids]
@@ -173,6 +172,21 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     ],
         betas=(0.9, 0.999), weight_decay=0
     )
+    # 
+    for param_group in optimizer.param_groups:
+        param_group["initial_lr"] = param_group["lr"]
+
+    # ===== scheduler settings =====
+    total_steps = len(train_dataloader) * args.num_train_epochs
+    warmup_steps = int(0.05 * total_steps)  # 5% warmup（必要なら調整）
+    # ===== get learning rate scale =====
+    def get_lr_scale(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        else:
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+
 
     end = time.time()
     batch_time = AverageMeter()
@@ -245,18 +259,18 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             if epoch == 0:
                 mf_weight = 0.0
             elif epoch == 1:
-                mf_weight = d * 0.05
+                mf_weight = 0.05
             elif epoch == 2:
-                mf_weight = d * 0.1
+                mf_weight = 0.1
             elif epoch == 3:
-                mf_weight = d * 0.25
+                mf_weight = 0.25
             elif epoch == 4:
-                mf_weight = d * 0.5
+                mf_weight = 0.5
             else:
-                mf_weight = d
+                mf_weight = 1.0
 
 
-            loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + d*loss_MF)
+            loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + mf_weight*d*loss_MF)
             #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
             loss = loss.mean()
             # update logs
@@ -274,6 +288,16 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             if _gaze_network.BertLayer.bert.backbone.conv1.weight.grad is not None:
                 _gaze_network.BertLayer.bert.backbone.conv1.weight.grad.data.clamp_(-1.0, 1.0)
             torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=0.5)
+
+            # ===== update learning rate (cosine + warmup) =====
+            # summary: 学習率をウォームアップとコサイン減衰でスケジュールする
+            global_step = epoch * max_iter + (iteration - 1)
+            lr_scale = get_lr_scale(global_step)
+
+            # 学習率をスケールして更新
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = param_group["initial_lr"] * lr_scale
+
             optimizer.step()
 
             batch_time.update(time.time() - end)
@@ -289,20 +313,9 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     f" eta: {eta_string}, epoch: {epoch}, iter: {iteration},"
                     f" loss: {log_losses.avg:.4f}, angle: {(log_dir.avg+log_seq.avg)/2:.3f},"
                     f" Rot: {log_Rot.avg:.3f}, MF: {log_MF.avg:.3f},"
-                    f" con: {log_con.avg:.6f}")
-
-            if False: #iteration%(args.logging_steps*10) == 0:
-                val = validate(args, val_dataloader, 
-                                    _gaze_network, 
-                                    smpl, 
-                                    mesh_sampler,
-                                    in_train=True
-                        )
-                print("val:", torch.rad2deg(torch.tensor(val)))
-
-                #checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
-                print("save trained model at ", checkpoint_dir)
-
+                    f" con: {log_con.avg:.6f}",
+                    f" lr: {optimizer.param_groups[0]['lr']:.1e}".replace("e-0", "e-")
+                    )
 
         checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
         print("save trained model at ", checkpoint_dir)
@@ -322,7 +335,6 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
     end = time.time()
     batch_time = AverageMeter()
 
-    #mse = AverageMeter()
     log_losses = AverageMeter()
     log_losses_front = AverageMeter()
     log_losses_back = AverageMeter()
