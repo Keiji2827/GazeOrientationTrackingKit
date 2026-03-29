@@ -116,7 +116,7 @@ def main(args):
     if not args.test:
         print("Train mode")
         dset = create_dataset(args)
-        train_idx, val_idx = np.arange(0, int(len(dset)*0.95)), np.arange(int(len(dset)*0.95), len(dset))
+        train_idx, val_idx = np.arange(0, int(len(dset)*0.99)), np.arange(int(len(dset)*0.99), len(dset))
         train_dset, val_dset = random_split(dset, [len(train_idx), len(val_idx)])
 
         train_dataloader = DataLoader(
