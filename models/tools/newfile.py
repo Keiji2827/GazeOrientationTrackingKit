@@ -314,7 +314,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     f" loss: {log_losses.avg:.4f}, angle: {(log_dir.avg+log_seq.avg)/2:.3f},"
                     f" Rot: {log_Rot.avg:.3f}, MF: {log_MF.avg:.3f},"
                     f" con: {log_con.avg:.6f}",
-                    f" lr: {optimizer.param_groups[0]['lr']:.1e}".replace("e-0", "e-")
+                    f" lr: {optimizer.param_groups[1]['lr']:.1e}".replace("e-0", "e-")
                     )
 
         checkpoint_dir = save_checkpoint(_gaze_network, args, epoch, iteration)
