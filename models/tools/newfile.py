@@ -284,7 +284,62 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             # back prop
             optimizer.zero_grad(set_to_none=True)
-            loss.backward() 
+
+            # ===== 軽量 NaN チェック（loss内訳の自動特定）=====
+            if not torch.isfinite(loss):
+                bad_terms = []
+
+                if not torch.isfinite(loss_seq):
+                    bad_terms.append(f"loss_seq={loss_seq.item()}")
+                if not torch.isfinite(loss_dir):
+                    bad_terms.append(f"loss_dir={loss_dir.item()}")
+                if not torch.isfinite(loss_mdir):
+                    bad_terms.append(f"loss_mdir={loss_mdir.item()}")
+                if not torch.isfinite(loss_Rot):
+                    bad_terms.append(f"loss_Rot={loss_Rot.item()}")
+                if not torch.isfinite(loss_MF):
+                    bad_terms.append(f"loss_MF={loss_MF.item()}")
+
+                # 個別lossは有限なのに total loss だけ非有限な場合も拾う
+                if len(bad_terms) == 0:
+                    bad_terms.append(f"total_loss={loss.item()} (components look finite)")
+
+                print(
+                    f"[WARN] Non-finite loss detected. "
+                    f"epoch={epoch}, iter={iteration}, "
+                    f"bad_terms: {', '.join(bad_terms)}"
+                )
+                continue
+
+            loss.backward()
+
+            # ===== 軽量 NaN チェック（loss内訳の自動特定）=====
+            if not torch.isfinite(loss):
+                bad_terms = []
+
+                if not torch.isfinite(loss_seq):
+                    bad_terms.append(f"loss_seq={loss_seq.item()}")
+                if not torch.isfinite(loss_dir):
+                    bad_terms.append(f"loss_dir={loss_dir.item()}")
+                if not torch.isfinite(loss_mdir):
+                    bad_terms.append(f"loss_mdir={loss_mdir.item()}")
+                if not torch.isfinite(loss_Rot):
+                    bad_terms.append(f"loss_Rot={loss_Rot.item()}")
+                if not torch.isfinite(loss_MF):
+                    bad_terms.append(f"loss_MF={loss_MF.item()}")
+
+                # 個別lossは有限なのに total loss だけ非有限な場合も拾う
+                if len(bad_terms) == 0:
+                    bad_terms.append(f"total_loss={loss.item()} (components look finite)")
+
+                print(
+                    f"[WARN] Non-finite loss detected. "
+                    f"epoch={epoch}, iter={iteration}, "
+                    f"bad_terms: {', '.join(bad_terms)}"
+                )
+                continue
+
+
             if _gaze_network.BertLayer.bert.backbone.conv1.weight.grad is not None:
                 _gaze_network.BertLayer.bert.backbone.conv1.weight.grad.data.clamp_(-1.0, 1.0)
             torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=0.5)
