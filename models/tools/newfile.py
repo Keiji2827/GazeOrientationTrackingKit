@@ -363,8 +363,10 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
             # forward-pass
             direction, S_diag = gaze_network(batch_imgs, smpl, mesh_sampler, is_train=False)
 
-            confidence = S_diag.sum(dim=-1).detach()
-            confidence = confidence / (confidence.max() + 1e-8)
+            confidence = torch.tensor(0.0).cuda(args.device)
+            if not args.no_use_MF:
+                confidence = S_diag.sum(dim=-1).detach()
+                confidence = confidence / (confidence.max() + 1e-8)
 
             loss = criterion(direction,gaze_dir).mean()
 
