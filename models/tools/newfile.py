@@ -165,7 +165,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     optimizer = torch.optim.AdamW(
         [
-        {"params": backbone_params, "lr": args.lr * 0.02},
+        {"params": backbone_params, "lr": args.lr * 0.2},
         {"params": bertlayer_other_params, "lr": args.lr},
         {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr},
         {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
@@ -178,7 +178,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     # ===== scheduler settings =====
     total_steps = len(train_dataloader) * args.num_train_epochs
-    warmup_steps = int(0.05 * total_steps)  # 5% warmup（必要なら調整）
+    warmup_steps = int(0.2 * total_steps)  # 30% warmup（必要なら調整）
     # ===== get learning rate scale =====
     def get_lr_scale(step):
         if step < warmup_steps:
@@ -236,12 +236,18 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
             # compute target rotation matrices from gaze directions
             R_target = rotation_from_two_vectors(gaze_dir)
+            # ===== NaN防止: R_target を強制的に有限化 =====
+            R_target = torch.nan_to_num(R_target, nan=0.0, posinf=1.0, neginf=-1.0)
 
             # loss
-            loss_seq = criterion_seq(directions, gaze_dir).mean()
+            loss_seq = criterion_seq(directions, gaze_dir)
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
             loss_mdir = criterion_mdir(mdir, head_dir[:, frame,:]).mean()
             loss_Rot = criterion_Rot(R_mode, R_target).mean()
+            # ===== acos の NaN防止（内部対策）=====
+            loss_Rot = torch.nan_to_num(loss_Rot, nan=0.0, posinf=3.14, neginf=0.0)
+            loss_Rot = loss_Rot.mean()
+
             if not args.no_use_MF:
                 loss_MF = matrix_fisher_nll(pred_F, R_mode, S_diag, R_target).mean()
                 loss_MF = torch.clamp(loss_MF, -50.0, 50.0)
@@ -259,13 +265,13 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             if epoch == 0:
                 mf_weight = 0.0
             elif epoch == 1:
-                mf_weight = 0.05
-            elif epoch == 2:
                 mf_weight = 0.1
+            elif epoch == 2:
+                mf_weight = 0.2
             elif epoch == 3:
-                mf_weight = 0.25
-            elif epoch == 4:
                 mf_weight = 0.5
+            elif epoch == 4:
+                mf_weight = 1.
             else:
                 mf_weight = 1.0
 
@@ -312,32 +318,6 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 continue
 
             loss.backward()
-
-            # ===== 軽量 NaN チェック（loss内訳の自動特定）=====
-            if not torch.isfinite(loss):
-                bad_terms = []
-
-                if not torch.isfinite(loss_seq):
-                    bad_terms.append(f"loss_seq={loss_seq.item()}")
-                if not torch.isfinite(loss_dir):
-                    bad_terms.append(f"loss_dir={loss_dir.item()}")
-                if not torch.isfinite(loss_mdir):
-                    bad_terms.append(f"loss_mdir={loss_mdir.item()}")
-                if not torch.isfinite(loss_Rot):
-                    bad_terms.append(f"loss_Rot={loss_Rot.item()}")
-                if not torch.isfinite(loss_MF):
-                    bad_terms.append(f"loss_MF={loss_MF.item()}")
-
-                # 個別lossは有限なのに total loss だけ非有限な場合も拾う
-                if len(bad_terms) == 0:
-                    bad_terms.append(f"total_loss={loss.item()} (components look finite)")
-
-                print(
-                    f"[WARN] Non-finite loss detected. "
-                    f"epoch={epoch}, iter={iteration}, "
-                    f"bad_terms: {', '.join(bad_terms)}"
-                )
-                continue
 
 
             if _gaze_network.BertLayer.bert.backbone.conv1.weight.grad is not None:
