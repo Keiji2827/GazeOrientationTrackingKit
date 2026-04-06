@@ -12,6 +12,7 @@ from models.utils.matrix_fisher_loss import SO3GeodesicLoss, matrix_fisher_nll
 from models.utils.Angle_Error_loss import CosLoss, CosLossSingle
 from models.utils.metric_logger import AverageMeter
 from models.utils.miscellaneous import save_checkpoint, load_from_state_dict, create_dataset, create_testdataset, create_valdataset
+from models.utils.debug import *
 
 
 def parse_args():
@@ -149,14 +150,16 @@ def main(args):
 
     return 0
 
-
 def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_sampler):
     max_iter = len(train_dataloader)
-    print("len of dataset:",max_iter)
-
+    print("len of dataset:", max_iter)
 
     frame = args.n_frames // 2
     epochs = args.num_train_epochs
+
+    # ===== trace settings =====
+    TRACE_STOP = True         # True: 見つけた瞬間に停止
+
 
     # optimizer settings
     backbone_params = list(_gaze_network.BertLayer.bert.backbone.parameters())
@@ -165,14 +168,14 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     optimizer = torch.optim.AdamW(
         [
-        {"params": backbone_params, "lr": args.lr * 0.2},
-        {"params": bertlayer_other_params, "lr": args.lr},
-        {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr},
-        {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
-    ],
+            {"params": backbone_params, "lr": args.lr * 0.2},
+            {"params": bertlayer_other_params, "lr": args.lr},
+            {"params": _gaze_network.HeadMFLayer.parameters(), "lr": args.lr},
+            {"params": _gaze_network.LSTMlayer.parameters(), "lr": args.lr}
+        ],
         betas=(0.9, 0.999), weight_decay=0
     )
-    # 
+
     for param_group in optimizer.param_groups:
         param_group["initial_lr"] = param_group["lr"]
 
@@ -187,7 +190,6 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
             return 0.5 * (1.0 + np.cos(np.pi * progress))
 
-
     end = time.time()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -198,12 +200,15 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
     criterion_Rot  = SO3GeodesicLoss().cuda(args.device)
 
     for epoch in range(args.num_init_epoch, epochs):
+        _gaze_network.train()
+
         log_losses = AverageMeter()
         log_seq = AverageMeter()
         log_dir = AverageMeter()
         log_mdir = AverageMeter()
         log_Rot = AverageMeter()
         log_MF = AverageMeter()
+
         for iteration, batch in enumerate(train_dataloader):
 
             log_con = AverageMeter()
@@ -217,14 +222,36 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             #head_mask = batch["head_mask"].cuda(args.device)
 
             batch_size = batch_imgs.size(0)
-
-            #for param_group in optimizer.param_groups:
-            #    param_group["lr"] = args.lr
-
             data_time.update(time.time() - end)
+
+            optimizer.zero_grad(set_to_none=True)
+
 
             # forward-pass
             directions, mdir, R_mode, S_diag, pred_F, d_corr = _gaze_network(batch_imgs, smpl, mesh_sampler, is_train=True)
+
+            # ===== forward trace =====
+            if trace_active(epoch, iteration):
+                bad_forward = False
+                bad_forward |= check_tensor_finite("batch_imgs", batch_imgs, epoch, iteration, stop_on_bad=False)
+                bad_forward |= check_tensor_finite("gaze_dir", gaze_dir, epoch, iteration, stop_on_bad=False)
+                bad_forward |= check_tensor_finite("head_dir", head_dir, epoch, iteration, stop_on_bad=False)
+
+                bad_forward |= check_tensor_finite("directions", directions, epoch, iteration, stop_on_bad=False)
+                bad_forward |= check_tensor_finite("mdir", mdir, epoch, iteration, stop_on_bad=False)
+                bad_forward |= check_tensor_finite("R_mode", R_mode, epoch, iteration, stop_on_bad=False)
+                bad_forward |= check_tensor_finite("d_corr", d_corr, epoch, iteration, stop_on_bad=False)
+
+                if S_diag is not None:
+                    bad_forward |= check_tensor_finite("S_diag", S_diag, epoch, iteration, stop_on_bad=False)
+                if pred_F is not None:
+                    bad_forward |= check_tensor_finite("pred_F", pred_F, epoch, iteration, stop_on_bad=False)
+
+                if bad_forward:
+                    print(f"[TRACE] Forward corruption detected before loss. epoch={epoch}, iter={iteration}")
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: forward corruption")
+                    continue
 
             if not args.no_use_MF:
                 confidence = S_diag.sum(dim=-1).detach()
@@ -233,19 +260,39 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 # 数値安定化（STE）
                 S_safe = torch.clamp(S_diag, min=0.0, max=8.0)
                 S_diag = S_safe + (S_diag - S_diag.detach())
+            else:
+                confidence = torch.tensor(0.0, device=args.device)
 
             # compute target rotation matrices from gaze directions
-            R_target = rotation_from_two_vectors(gaze_dir)
+            R_target_raw = rotation_from_two_vectors(gaze_dir)
+            # ===== forward trace: R_target_raw =====
+            if trace_active(epoch, iteration):
+                if check_tensor_finite("R_target_raw", R_target_raw, epoch, iteration, stop_on_bad=False):
+                    print(f"[TRACE] raw R_target corrupted. epoch={epoch}, iter={iteration}")
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: raw R_target corruption")
+
             # ===== NaN防止: R_target を強制的に有限化 =====
-            R_target = torch.nan_to_num(R_target, nan=0.0, posinf=1.0, neginf=-1.0)
+            R_target = torch.nan_to_num(R_target_raw, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            if trace_active(epoch, iteration):
+                if check_tensor_finite("R_target", R_target, epoch, iteration, stop_on_bad=False):
+                    print(f"[TRACE] R_target corrupted. epoch={epoch}, iter={iteration}")
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: R_target corruption")
+                    continue
 
             # loss
             loss_seq = criterion_seq(directions, gaze_dir)
             loss_dir = criterion_dir(directions[:,frame,:],gaze_dir[:,frame,:]).mean()
             loss_mdir = criterion_mdir(mdir, head_dir[:, frame,:]).mean()
-            loss_Rot = criterion_Rot(R_mode, R_target).mean()
+            loss_Rot_raw = criterion_Rot(R_mode, R_target).mean()
+            # ===== loss trace: loss_Rot_raw =====
+            if trace_active(epoch, iteration):
+                check_scalar_finite("loss_Rot_raw", loss_Rot_raw, epoch, iteration, stop_on_bad=False)
             # ===== acos の NaN防止（内部対策）=====
-            loss_Rot = torch.nan_to_num(loss_Rot, nan=0.0, posinf=3.14, neginf=0.0)
+            loss_Rot = torch.nan_to_num(loss_Rot_raw, nan=0.0, posinf=3.14, neginf=0.0)
+
             loss_Rot = loss_Rot.mean()
 
             if not args.no_use_MF:
@@ -276,20 +323,33 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 mf_weight = 1.0
 
 
-            loss = ((a)*loss_seq  + b*loss_dir + m*loss_mdir + c*loss_Rot + mf_weight*d*loss_MF)
-            #loss = confidence*((a)*loss_seq  + b*loss_dir + c*loss_Rot + d*loss_MF)
+            loss = a*loss_seq + b*loss_dir + m*loss_mdir + c*loss_Rot + mf_weight*d*loss_MF
             loss = loss.mean()
-            # update logs
-            log_losses.update(loss.item(), batch_size)
-            log_seq.update(torch.rad2deg(loss_seq).item(), batch_size)
-            log_dir.update(torch.rad2deg(loss_dir).item(), batch_size)
-            log_mdir.update(torch.rad2deg(loss_mdir).item(), batch_size)
-            log_Rot.update(torch.rad2deg(loss_Rot).item(), batch_size)
-            log_MF.update(loss_MF.item(), batch_size)
-            log_con.update(confidence.mean().item(), batch_size)
 
-            # back prop
-            optimizer.zero_grad(set_to_none=True)
+            # ===== loss trace =====
+            if trace_active(epoch, iteration):
+                bad_loss = False
+                bad_loss |= check_scalar_finite("loss_seq", loss_seq, epoch, iteration, stop_on_bad=False)
+                bad_loss |= check_scalar_finite("loss_dir", loss_dir, epoch, iteration, stop_on_bad=False)
+                bad_loss |= check_scalar_finite("loss_mdir", loss_mdir, epoch, iteration, stop_on_bad=False)
+                bad_loss |= check_scalar_finite("loss_Rot", loss_Rot, epoch, iteration, stop_on_bad=False)
+                bad_loss |= check_scalar_finite("loss_MF", loss_MF, epoch, iteration, stop_on_bad=False)
+                bad_loss |= check_scalar_finite("loss_total", loss, epoch, iteration, stop_on_bad=False)
+
+                if bad_loss:
+                    print(f"[TRACE] Loss corruption detected. epoch={epoch}, iter={iteration}")
+                    print(tensor_stat_str(directions, "directions"))
+                    print(tensor_stat_str(mdir, "mdir"))
+                    print(tensor_stat_str(R_mode, "R_mode"))
+                    print(tensor_stat_str(R_target, "R_target"))
+                    if S_diag is not None:
+                        print(tensor_stat_str(S_diag, "S_diag"))
+                    if pred_F is not None:
+                        print(tensor_stat_str(pred_F, "pred_F"))
+
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: loss corruption")
+                    continue
 
             # ===== 軽量 NaN チェック（loss内訳の自動特定）=====
             if not torch.isfinite(loss):
@@ -315,17 +375,29 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                     f"epoch={epoch}, iter={iteration}, "
                     f"bad_terms: {', '.join(bad_terms)}"
                 )
+
+                if TRACE_STOP:
+                    raise RuntimeError("Stopped by WARN: non-finite loss")
                 continue
 
             loss.backward()
 
+            # ===== grad trace =====
+            if trace_active(epoch, iteration):
+                if check_grads_finite(_gaze_network, epoch, iteration, stop_on_bad=False):
+                    print(f"[TRACE] Backward corruption detected. epoch={epoch}, iter={iteration}")
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: gradient corruption")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
+            # optional local clamp
             if _gaze_network.BertLayer.bert.backbone.conv1.weight.grad is not None:
                 _gaze_network.BertLayer.bert.backbone.conv1.weight.grad.data.clamp_(-1.0, 1.0)
+
             torch.nn.utils.clip_grad_norm_(_gaze_network.parameters(), max_norm=0.5)
 
-            # ===== update learning rate (cosine + warmup) =====
-            # summary: 学習率をウォームアップとコサイン減衰でスケジュールする
+            # ===== lr update =====
             global_step = epoch * max_iter + (iteration - 1)
             lr_scale = get_lr_scale(global_step)
 
@@ -334,6 +406,23 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 param_group["lr"] = param_group["initial_lr"] * lr_scale
 
             optimizer.step()
+
+            # ===== parameter trace =====
+            if trace_active(epoch, iteration):
+                if check_params_finite(_gaze_network, epoch, iteration, stop_on_bad=False):
+                    print(f"[TRACE] Parameter corruption detected after step. epoch={epoch}, iter={iteration}")
+                    if TRACE_STOP:
+                        raise RuntimeError("Stopped by TRACE_NAN: parameter corruption")
+                    break
+
+            # ===== logs =====
+            log_losses.update(loss.item(), batch_size)
+            log_seq.update(torch.rad2deg(loss_seq).item(), batch_size)
+            log_dir.update(torch.rad2deg(loss_dir).item(), batch_size)
+            log_mdir.update(torch.rad2deg(loss_mdir).item(), batch_size)
+            log_Rot.update(torch.rad2deg(loss_Rot).item(), batch_size)
+            log_MF.update(loss_MF.item(), batch_size)
+            log_con.update(confidence.mean().item(), batch_size)
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -364,6 +453,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
 
     return 0
+
 
 def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=False):
     max_iter = len(val_dataloader)
