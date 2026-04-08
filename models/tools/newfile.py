@@ -182,7 +182,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     # ===== scheduler settings =====
     total_steps = len(train_dataloader) * args.num_train_epochs
-    warmup_steps = int(0.2 * total_steps)  # 30% warmup（必要なら調整）
+    warmup_steps = int(0.3 * total_steps)  # 30% warmup（必要なら調整）
     # ===== get learning rate scale =====
     def get_lr_scale(step):
         if step < warmup_steps:
