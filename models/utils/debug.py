@@ -33,6 +33,9 @@ def tensor_stat_str(x, name):
                         f", finite_mean={xf.mean().item():.6e}"
                         f", finite_absmax={xf.abs().max().item():.6e}"
                     )
+                else:
+                    msg += ", all values are non-finite"
+
         return msg
 
 

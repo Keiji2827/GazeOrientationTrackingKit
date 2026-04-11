@@ -351,7 +351,7 @@ class BertLayer(torch.nn.Module):
         dir = self.total_mlp1(torch.cat((x, mdir), dim=1))
         dir = self.total_tanh1(dir)
         dir = self.total_mlp2(dir)
-        mdir = mdir / mdir.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        dir = dir / dir.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
         if is_train == True:
             return dir, mdir
