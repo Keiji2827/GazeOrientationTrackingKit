@@ -179,15 +179,18 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 confidence = torch.tensor(0.0, device=args.device)
 
             # target rotations
-            R_target = torch.nan_to_num(rotation_from_two_vectors(gaze_dir))
+            R_mode_safe = torch.nan_to_num(R_mode, nan=0.0, posinf=1.0, neginf=-1.0)
+            R_target = torch.nan_to_num(rotation_from_two_vectors(gaze_dir), nan=0.0, posinf=1.0, neginf=-1.0)
 
 
             # loss
             loss_seq = criterion_seq(directions, gaze_dir)
             loss_dir = criterion_dir(directions[:, frame, :], gaze_dir[:, frame, :]).mean()
-            loss_mdir = criterion_mdir(mdir, head_dir[:, frame, :]).mean()
 
-            loss_Rot = torch.nan_to_num(criterion_Rot(R_mode, R_target).mean())
+            mdir_safe = torch.nan_to_num(mdir, nan=0.0, posinf=1.0, neginf=-1.0)
+            loss_mdir = criterion_mdir(mdir_safe, head_dir[:, frame, :]).mean()
+
+            loss_Rot = torch.nan_to_num(criterion_Rot(R_mode_safe, R_target).mean(), nan=0.0, posinf=3.14, neginf=0.0)
 
 
             if not args.no_use_MF:
@@ -220,8 +223,8 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
             loss = loss.mean()
 
             # NaNチェック,もしNaNがあれば、そのイテレーションをスキップして次に進む
-            if not torch.isfinite(loss):
-                print(f"[SKIP] NaN detected at epoch={epoch}, iter={iteration}")
+            if (not torch.isfinite(loss)) or (not torch.isfinite(loss_mdir)) or (not torch.isfinite(loss_Rot)):
+                print(f"[SKIP] NaN detected at epoch={epoch}, iter={iteration}, loss_mdir={loss_mdir.item()}, loss_Rot={loss_Rot.item()}")
 
                 # 勾配が残らないように
                 optimizer.zero_grad(set_to_none=True)
@@ -240,6 +243,21 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
                 conv1_grad = _gaze_network.BertLayer.bert.backbone.conv1.weight.grad
                 conv1_grad.data = torch.nan_to_num(conv1_grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
                 conv1_grad.data.clamp_(-0.1, 0.1)
+
+            if hasattr(_gaze_network.BertLayer, "body_mlp1") and \
+               hasattr(_gaze_network.BertLayer.body_mlp1, "weight") and \
+               _gaze_network.BertLayer.body_mlp1.weight.grad is not None:
+                body_mlp1_grad = _gaze_network.BertLayer.body_mlp1.weight.grad
+                body_mlp1_grad.data = torch.nan_to_num(body_mlp1_grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                body_mlp1_grad.data.clamp_(-0.1, 0.1)
+
+            if hasattr(_gaze_network.BertLayer, "body_mlp1") and \
+               hasattr(_gaze_network.BertLayer.body_mlp1, "bias") and \
+               _gaze_network.BertLayer.body_mlp1.bias is not None and \
+               _gaze_network.BertLayer.body_mlp1.bias.grad is not None:
+                body_mlp1_bias_grad = _gaze_network.BertLayer.body_mlp1.bias.grad
+                body_mlp1_bias_grad.data = torch.nan_to_num(body_mlp1_bias_grad.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                body_mlp1_bias_grad.data.clamp_(-0.1, 0.1)
 
             # ===== NaN防止: 勾配クリッピング =====
             if hasattr(_gaze_network.BertLayer.bert.backbone.conv1, "bias") and \
