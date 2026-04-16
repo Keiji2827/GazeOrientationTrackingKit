@@ -96,7 +96,6 @@ def rotation_matrices_from_gaze(gaze_dir):
     R = I + sin_t * K + (1 - cos_t) * (K @ K)
 
     return R  # (batch, n_frames-1, 3, 3)
-
 def skew(v):
     """
     v: (..., 3)
@@ -120,18 +119,21 @@ def rotation_from_two_vectors(gaze_dir, eps=1e-6):
     a = gaze_dir[:, :-1, :]  # (batch, n_frames-1, 3)
     b = gaze_dir[:, 1:, :]   # (batch, n_frames-1, 3)
 
-    #a = a / a.norm(dim=-1, keepdim=True)
-    #b = b / b.norm(dim=-1, keepdim=True)
+    a = a / a.norm(dim=-1, keepdim=True).clamp(min=eps)
+    b = b / b.norm(dim=-1, keepdim=True).clamp(min=eps)
 
     v = torch.cross(a, b, dim=-1)
     c = (a * b).sum(dim=-1, keepdim=True)         # (B, F-1, 1)
-    c = c.unsqueeze(-1)   
+    c = torch.clamp(c, min=-1.0, max=1.0)
+    c = c.unsqueeze(-1)
 
     vx = skew(v)
     I = torch.eye(3, device=gaze_dir.device, dtype=gaze_dir.dtype)
     I = I.unsqueeze(0).unsqueeze(0)          # (1, 1, 3, 3)
 
-    R = I + vx + (vx @ vx) * (1.0 / (1.0 + c + eps))
+    denom = (1.0 + c).clamp(min=eps)
+    R = I + vx + (vx @ vx) * (1.0 / denom)
+    R = torch.nan_to_num(R, nan=0.0, posinf=1.0, neginf=-1.0)
 
     return R
 
