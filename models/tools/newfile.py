@@ -74,7 +74,7 @@ def main(args):
         print("Load checkpoint from {}".format(args.model_checkpoint))
         dset = create_testdataset(args)
         test_dataloader = DataLoader(
-            dset, batch_size=24, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True
+            dset, batch_size=16, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True
         )
 
         val = validate(args, test_dataloader, _gaze_network, smpl, mesh_sampler)
@@ -119,7 +119,7 @@ def train(args, train_dataloader, val_dataloader, _gaze_network, smpl, mesh_samp
 
     # ===== scheduler settings =====
     total_steps = len(train_dataloader) * args.num_train_epochs
-    warmup_steps = int(0.3 * total_steps)  # 30% warmup（必要なら調整）
+    warmup_steps = int(0.2 * total_steps)  # 30% warmup（必要なら調整）
     # ===== get learning rate scale =====
     def get_lr_scale(step):
         if step < warmup_steps:
@@ -337,6 +337,10 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
     count_back = 0
 
     print("len of dataset:", max_iter)
+
+    if not in_train:
+        print("index,batch_iter,batch_index,pred_x,pred_y,pred_z,gt_x,gt_y,gt_z")
+
     with torch.no_grad():
         for iteration, batch in enumerate(val_dataloader):
             iteration += 1
@@ -386,7 +390,12 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if iteration%args.logging_steps == 0 or iteration == max_iter:
+
+            if not in_train:
+                output_csv(direction, gaze_dir, iteration-1, batch_size)
+
+
+            if 1 and (iteration%args.logging_steps == 0 or iteration == max_iter):
                 eta_seconds = batch_time.avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
@@ -394,7 +403,8 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
                       f"loss: {log_losses.avg:.4f},"
                       f"loss_front: {log_losses_front.avg:.3f},"
                       f"loss_back: {log_losses_back.avg:.3f},"
-                      f"con: {confidence.mean().item():.3f}")
+                      f"con: {confidence.mean().item():.3f}"
+                      )
 
                 if in_train:
                     return log_losses.avg
@@ -405,6 +415,26 @@ def validate(args, val_dataloader, gaze_network, smpl, mesh_sampler, in_train=Fa
 
     return log_losses.avg
 
+
+
+
+
+def output_csv(direction, gaze_dir, iteration, batch_size):
+    direction = direction.detach().cpu()
+    gaze_dir = gaze_dir.detach().cpu()
+
+    for i in range(batch_size):
+        print(
+            f"{iteration*batch_size + i},"
+            f"{iteration},"
+            f"{i},"
+            f"{direction[i,0].item()},"
+            f"{direction[i,1].item()},"
+            f"{direction[i,2].item()},"
+            f"{gaze_dir[i,0].item()},"
+            f"{gaze_dir[i,1].item()},"
+            f"{gaze_dir[i,2].item()}"
+        )
 
 if __name__ == "__main__":
     args = parse_args()
