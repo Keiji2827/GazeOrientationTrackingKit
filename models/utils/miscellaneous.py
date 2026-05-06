@@ -162,14 +162,17 @@ def create_testdataset(args):
 
     if args.is_GAFA:
         exp_names = [
-            'library/1029_2', #
+            'library/1029_2',
             'lab/1013_2',
             'kitchen/1022_2',
             'living_room/006',
             'courtyard/002',
             'courtyard/003',  
             ]
-        random.shuffle(exp_names)
+        #random.shuffle(exp_names)
+        if args.dataset:
+            exp_names = args.dataset
+    
         # GAFA dataset
         dset = create_gafa_dataset(exp_names=exp_names, n_frames=args.n_frames)
 

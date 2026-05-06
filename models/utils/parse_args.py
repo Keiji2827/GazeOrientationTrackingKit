@@ -62,6 +62,8 @@ def parse_args():
                         help="ablation study: without LSTM, just use cumulative rotations")
     parser.add_argument('--no_use_MF', action='store_true', default=False,
                         help="ablation study: without matrix fisher loss")
+    parser.add_argument('--dataset', type=str, nargs='*', default="", 
+                        help="use test scene.")
 
     args = parser.parse_args()
     return args
